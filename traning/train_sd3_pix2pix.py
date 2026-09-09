@@ -816,21 +816,22 @@ def main():
 
     # TODO
     logger.info("Initializing the new channel of DIT from the pretrained DIT.")
-    in_channels = int(1.5 * transformer.config.in_channels) if args.do_mask else 2 * transformer.config.in_channels # 48 for mask
+    in_channels = int(1.5 * transformer.config.in_channels) if args.do_mask else 2 * transformer.config.in_channels # 24 for else 32
     out_channels = transformer.pos_embed.proj.out_channels
 
-    load_num_channel = transformer.config.in_channels
+    load_num_channel = transformer.config.in_channels #   "in_channels": 16,
     print("Do mask",args.do_mask)
     print("new in_channels",in_channels)
     print("load_num_channel",load_num_channel)
 
-    transformer.register_to_config(in_channels=in_channels)
+    transformer.register_to_config(in_channels=in_channels) # REGISTERED TO CONFIG 
     print("transformer.pos_embed.proj.weight.shape", transformer.pos_embed.proj.weight.shape)
     print("load_num_channel", load_num_channel)
-    with torch.no_grad():
 
+    # CHANNEL PLAYOUT / REPLACEMENT DONE HERE 
+    with torch.no_grad():
         new_proj = nn.Conv2d(
-            in_channels, out_channels, kernel_size=(transformer.config.patch_size, transformer.config.patch_size),
+            in_channels, out_channels, kernel_size=(transformer.config.patch_size, transformer.config.patch_size), # 2x2 kernel size 
             stride=transformer.config.patch_size, bias=True
         )
         print("new_proj", new_proj)
@@ -847,7 +848,7 @@ def main():
         new_proj.bias.copy_(transformer.pos_embed.proj.bias)
         print("new_proj", new_proj.weight.shape)
         print("transformer.pos_embed.proj", transformer.pos_embed.proj.weight.shape)
-        transformer.pos_embed.proj = new_proj
+        transformer.pos_embed.proj = new_proj # CHANGE layer to perform that channel playout !! 
 
     for param in transformer.parameters():
         param.requires_grad = True
@@ -1350,7 +1351,7 @@ def main():
     if accelerator.is_main_process:
         accelerator.init_trackers("instruct-pix2pix_sd3", config=vars(args))
 
-    # Train!
+    # Train! 
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
@@ -1440,7 +1441,7 @@ def main():
                     tokens_two = tokenize_prompt(tokenizer_two, prompt)
                     tokens_three = tokenize_prompt(tokenizer_three, prompt, args.max_sequence_length)
 
-                latents = vae.encode(pixel_values).latent_dist.sample()
+                latents = vae.encode(pixel_values).latent_dist.sample() #latent of edited / target image 
                 latents = latents * vae.config.scaling_factor
                 latents = latents.to(dtype=weight_dtype)
 
@@ -1465,17 +1466,16 @@ def main():
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
-                noisy_model_input = sigmas * noise + (1.0 - sigmas) * latents
+                noisy_model_input = sigmas * noise + (1.0 - sigmas) * latents #make edited latent noisy here
 
                 # Get the additional image embedding for conditioning.
                 # Instead of getting a diagonal Gaussian here, we simply take the mode.
-                original_image_embeds = vae.encode(batch["original_pixel_values"].to(vae.dtype)).latent_dist.mode()
-                concatenated_noisy_latents = torch.cat([noisy_model_input, original_image_embeds], dim=1)
+                original_image_embeds = vae.encode(batch["original_pixel_values"].to(vae.dtype)).latent_dist.mode() # ORIGINAL IMAGE LATENT 
+                concatenated_noisy_latents = torch.cat([noisy_model_input, original_image_embeds], dim=1) # CONCATENATING BOTH THE NOISY EDITED LATENT + CLEAN ORIGINAL IMAGE LATENT ( DIM = 1,C,H,W) SO CONCATENATING IT BASED ON THE CHANNELS , MAKING IT 1,2C,H,W
 
                 if args.do_mask:
                     mask_embeds = vae.encode(batch["mask_pixel_values"].to(vae.dtype)).latent_dist.mode()
                     concatenated_noisy_latents = torch.cat([concatenated_noisy_latents, mask_embeds], dim=1)
-
 
                 # Predict the noise residual
                 if not args.train_text_encoder:
@@ -1486,7 +1486,7 @@ def main():
                         pooled_projections=pooled_prompt_embeds,
                         return_dict=False,
                         # mask_index = mask_index
-                    )[0]
+                    )[0] # SAME OUTPUT SIZE : [1,2C,H,W]
                 else:
                     prompt_embeds, pooled_prompt_embeds = encode_prompt(
                         text_encoders=[text_encoder_one, text_encoder_two, text_encoder_three],
@@ -1507,7 +1507,7 @@ def main():
 
                     )[0]
 
-                model_pred = model_pred * (-sigmas) + noisy_model_input
+                model_pred = noisy_model_input - (sigmas) * model_pred
                 # these weighting schemes use a uniform timestep sampling
                 # and instead post-weight the loss
                 if args.weighting_scheme == "sigma_sqrt":
@@ -1518,7 +1518,7 @@ def main():
                 else:
                     weighting = torch.ones_like(sigmas)
 
-                target = latents
+                target = latents # TARGET IMAGE LATENTS
                 # Conditioning dropout to support classifier-free guidance during inference. For more details
                 # check out the section 3.2.1 of the original paper https://arxiv.org/abs/2211.09800.
 
