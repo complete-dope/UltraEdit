@@ -107,6 +107,7 @@ if getattr(torch, "distributed", None) is not None:
 if is_wandb_available():
     import wandb
 
+from channel_concat_denoise import denoise_channel_concat
 from wandb_logging import InferenceTable
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -523,6 +524,33 @@ def parse_args(input_args=None):
             "listed bucket (smaller images are upscaled). When set, --resolution is ignored."
         ),
     )
+    # sd3-pix2pix flag names, accepted as aliases for the flux column args
+    parser.add_argument("--edit_prompt_column", type=str, default='caption', help="Alias for --caption_column.")
+    parser.add_argument("--original_image_column", type=str, default='merged_img', help="Alias for --cond_image_column.")
+    parser.add_argument("--edited_image_column", type=str, default='edited_img', help="Alias for --image_column.")
+    parser.add_argument(
+        "--resolution_height",
+        type=int,
+        default=1360,
+        help="Target height. With --resolution_width, images are resized to cover and cropped to this exact "
+        "size (one fixed bucket). Overrides --resolution.",
+    )
+    parser.add_argument("--resolution_width", type=int, default=2048, help="Target width, see --resolution_height.")
+    parser.add_argument(
+        "--x_embedder_lr",
+        type=float,
+        default=None,
+        help="Separate LR for x_embedder. With --channel_concat_cond its cond half is zero-init, so at the "
+        "body LR it grows too slowly to ever use the cond image. Defaults to --learning_rate.",
+    )
+    parser.add_argument(
+        "--transformer_dtype",
+        type=str,
+        default='fp32',
+        choices=["fp32", "bf16", "fp16"],
+        help="dtype the transformer weights are held in. Defaults to the --mixed_precision dtype. Use fp32 to "
+        "keep master weights in fp32 while autocast still computes in bf16.",
+    )
     parser.add_argument(
         "--use_aspect_ratio_buckets",
         action="store_true",
@@ -808,6 +836,14 @@ def parse_args(input_args=None):
         args = parser.parse_args(input_args)
     else:
         args = parser.parse_args()
+
+    for alias, canonical in (
+        ("edit_prompt_column", "caption_column"),
+        ("original_image_column", "cond_image_column"),
+        ("edited_image_column", "image_column"),
+    ):
+        if getattr(args, alias) is not None:
+            setattr(args, canonical, getattr(args, alias))
 
     if args.local_dataset_path == "":
         args.local_dataset_path = None
@@ -1333,6 +1369,11 @@ def main(args):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
+    # held separately: fp32 master weights + bf16 autocast is the stable setup for a full finetune
+    transformer_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}.get(
+        args.transformer_dtype, weight_dtype
+    )
+
     # Load scheduler and models
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -1365,7 +1406,7 @@ def main(args):
         revision=args.revision,
         variant=args.variant,
         quantization_config=quantization_config,
-        torch_dtype=weight_dtype,
+        torch_dtype=transformer_dtype,
     )
     if args.bnb_quantization_config_path is not None:
         transformer = prepare_model_for_kbit_training(transformer, use_gradient_checkpointing=False)
@@ -1381,8 +1422,10 @@ def main(args):
             new_proj.weight.zero_()
             new_proj.weight[:, : old_proj.in_features].copy_(old_proj.weight)
         model.x_embedder = new_proj
-        model.register_to_config(in_channels=new_in)
-        logger.info(f"Widened x_embedder in_features {old_proj.in_features} -> {new_in} for channel concat")
+        # out_channels defaults to in_channels, but proj_out is NOT widened -- record it
+        # explicitly or the checkpoint cannot be reloaded with from_pretrained
+        model.register_to_config(in_channels=new_in, out_channels=old_proj.in_features)
+        logger.info(f"Widened x_embedder in_features {old_proj.in_features} -> {new_in} for channel concat") # register_to-config only writes metadata into the model's config dict, touches nothing in weight
 
     if args.channel_concat_cond:
         widen_x_embedder(transformer)
@@ -1420,7 +1463,7 @@ def main(args):
     transformer_to_kwargs = (
         {"device": accelerator.device}
         if args.bnb_quantization_config_path is not None
-        else {"device": accelerator.device, "dtype": weight_dtype}
+        else {"device": accelerator.device, "dtype": transformer_dtype}
     )
 
     is_fsdp = getattr(accelerator.state, "fsdp_plugin", None) is not None
@@ -1616,8 +1659,19 @@ def main(args):
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
 
     # Optimization parameters
-    transformer_parameters_with_lr = {"params": transformer_trainable_parameters, "lr": args.learning_rate}
-    params_to_optimize = [transformer_parameters_with_lr]
+    if args.x_embedder_lr is not None:
+        xe_params = [p for k, p in transformer.named_parameters() if p.requires_grad and "x_embedder" in k]
+        body_params = [p for k, p in transformer.named_parameters() if p.requires_grad and "x_embedder" not in k]
+        params_to_optimize = [
+            {"params": body_params, "lr": args.learning_rate},
+            {"params": xe_params, "lr": args.x_embedder_lr},
+        ]
+        logger.info(
+            f"param groups: body={len(body_params)} tensors @ {args.learning_rate}, "
+            f"x_embedder={len(xe_params)} tensors @ {args.x_embedder_lr}"
+        )
+    else:
+        params_to_optimize = [{"params": transformer_trainable_parameters, "lr": args.learning_rate}]
 
     # Optimizer creation
     if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
@@ -1683,7 +1737,15 @@ def main(args):
     # single square bucket reproduces the fixed-size resize + crop.
     if args.aspect_ratio_buckets is not None and not args.use_aspect_ratio_buckets:
         raise ValueError("--aspect_ratio_buckets requires --use_aspect_ratio_buckets to be set.")
-    if args.aspect_ratio_buckets is not None:
+    if (args.resolution_height is None) != (args.resolution_width is None):
+        raise ValueError("--resolution_height and --resolution_width must be given together.")
+    if args.resolution_height is not None and args.aspect_ratio_buckets is not None:
+        raise ValueError("Specify only one of --resolution_height/--resolution_width or --aspect_ratio_buckets.")
+    if args.resolution_height is not None:
+        buckets = [(args.resolution_height, args.resolution_width)]
+        use_aspect_ratio_buckets = False
+        logger.info(f"Using fixed resolution bucket: {buckets}")
+    elif args.aspect_ratio_buckets is not None:
         buckets = parse_buckets_string(args.aspect_ratio_buckets)
         use_aspect_ratio_buckets = False
         logger.info(f"Using explicit aspect ratio buckets: {buckets}")
@@ -1919,7 +1981,10 @@ def main(args):
     transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         transformer, optimizer, train_dataloader, lr_scheduler
     )
-
+    logger.info(
+        "post-prepare optimizer groups: "
+        + ", ".join(f"[{k}] lr={g['lr']} n={len(g['params'])}" for k, g in enumerate(optimizer.param_groups))
+    )
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -2155,15 +2220,35 @@ def main(args):
                         break
                     target = (item["pixel_values"][i : i + 1] * 0.5 + 0.5).clamp(0, 1).to(device)
                     cond_image = TF.to_pil_image((item["cond_pixel_values"][i] * 0.5 + 0.5).clamp(0, 1))
-                    pred = pipeline(
-                        image=cond_image,
-                        prompt_embeds=item["prompt_embeds"][i : i + 1].to(device),
-                        negative_prompt_embeds=val_negative_prompt_embeds.to(device),
-                        num_inference_steps=args.eval_inference_steps,
-                        guidance_scale=args.eval_guidance_scale,
-                        generator=torch.Generator(device=device).manual_seed(n_done),
-                        output_type="pt",
-                    ).images.to(device, dtype=torch.float32)
+                    if args.channel_concat_cond:
+                        # stock pipeline appends cond as tokens; this model wants them channel-wise
+                        cond_lat = item["cond_latents"][i : i + 1].to(device, dtype=torch.float32)
+                        decoded = denoise_channel_concat(
+                            transformer=unwrap_model(transformer),
+                            vae=pipeline.vae,
+                            scheduler=pipeline.scheduler,
+                            cond_latents=cond_lat,
+                            prompt_embeds=item["prompt_embeds"][i : i + 1],
+                            text_ids=item["text_ids"][i : i + 1] if item["text_ids"].ndim == 3 else item["text_ids"],
+                            latents_bn_mean=latents_bn_mean,
+                            latents_bn_std=latents_bn_std,
+                            num_inference_steps=args.eval_inference_steps,
+                            guidance_scale=args.eval_guidance_scale,
+                            generator=torch.Generator(device="cpu").manual_seed(n_done),
+                            device=device,
+                            dtype=weight_dtype,
+                        )
+                        pred = (decoded * 0.5 + 0.5).clamp(0, 1).to(device, dtype=torch.float32)
+                    else:
+                        pred = pipeline(
+                            image=cond_image,
+                            prompt_embeds=item["prompt_embeds"][i : i + 1].to(device),
+                            negative_prompt_embeds=val_negative_prompt_embeds.to(device),
+                            num_inference_steps=args.eval_inference_steps,
+                            guidance_scale=args.eval_guidance_scale,
+                            generator=torch.Generator(device=device).manual_seed(n_done),
+                            output_type="pt",
+                        ).images.to(device, dtype=torch.float32)
                     if pred.shape[-2:] != target.shape[-2:]:
                         pred = F.interpolate(pred, size=target.shape[-2:], mode="bilinear", align_corners=False)
                     sample_mse = F.mse_loss(pred, target).item()
@@ -2190,6 +2275,15 @@ def main(args):
             logs.update(
                 {"val_mse": mse_sum / n_done, "val_psnr": psnr.compute().item(), "val_lpips": lpips.compute().item()}
             )
+
+        try:
+            xw = unwrap_model(transformer).x_embedder.weight
+            xw = xw.to_local() if hasattr(xw, "to_local") else xw
+            half = xw.shape[1] // 2
+            img_mag = xw[:, :half].abs().mean()
+            logs["cond_img_ratio"] = (xw[:, half:].abs().mean() / img_mag.clamp_min(1e-12)).item()
+        except Exception as e:
+            logger.warning(f"cond_img_ratio unavailable: {e}")
 
         logger.info(f"step {step} eval: " + ", ".join(f"{k}={v:.4f}" for k, v in logs.items()))
         accelerator.log(logs, step=step)
@@ -2285,8 +2379,11 @@ def main(args):
                                 # never let a flaky upload kill a training run
                                 logger.warning(f"Checkpoint upload failed: {e}")
 
-                if val_cache and accelerator.is_main_process and global_step % args.eval_steps == 0:
-                    run_eval(global_step, epoch)
+                if val_cache and (accelerator.is_main_process or is_fsdp) and global_step % args.eval_steps == 0:
+                    try:
+                        run_eval(global_step, epoch)
+                    except Exception as e:
+                        logger.error(f"eval at step {global_step} failed, training continues: {e}", exc_info=True)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -2320,7 +2417,7 @@ def main(args):
                 del pipeline
                 free_memory()
 
-    if val_cache and accelerator.is_main_process and global_step % args.eval_steps != 0:
+    if val_cache and (accelerator.is_main_process or is_fsdp) and global_step % args.eval_steps != 0:
         run_eval(global_step, epoch)
 
     # Save the trained transformer weights (LoRA adapters or the full model)
