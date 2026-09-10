@@ -107,6 +107,8 @@ if getattr(torch, "distributed", None) is not None:
 if is_wandb_available():
     import wandb
 
+from wandb_logging import InferenceTable
+
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.41.0.dev0")
 
@@ -198,6 +200,7 @@ def log_validation(
     epoch,
     torch_dtype,
     is_final_validation=False,
+    global_step=None,
 ):
     args.num_validation_images = args.num_validation_images if args.num_validation_images else 1
     logger.info(
@@ -223,8 +226,23 @@ def log_validation(
             ).images[0]
             images.append(image)
 
+    phase_name = "test" if is_final_validation else "validation"
+    table = InferenceTable(accelerator)
+    for i, image in enumerate(images):
+        table.add(
+            step=global_step,
+            epoch=epoch,
+            sample=i,
+            prompt=args.validation_prompt,
+            seed=args.seed,
+            guidance_scale=None,
+            num_inference_steps=None,
+            source=pipeline_args["image"],
+            prediction=image,
+        )
+    table.log(f"{phase_name}/samples", step=global_step)
+
     for tracker in accelerator.trackers:
-        phase_name = "test" if is_final_validation else "validation"
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
@@ -432,6 +450,13 @@ def parse_args(input_args=None):
         help="Height of the center crop used for the validation split. Defaults to --train_height.",
     )
     parser.add_argument("--validation_width", type=int, default=None, help="Width of the validation center crop.")
+    parser.add_argument(
+        "--conditioning_dropout_prob",
+        type=float,
+        default=None,
+        help="InstructPix2Pix CFG dropout. With p: drop text only for p, image only for p, both for p. "
+        "Needed for image_guidance_scale at inference. 0.05 in the paper. Off when unset.",
+    )
     parser.add_argument(
         "--val_split_ratio",
         type=float,
@@ -1757,6 +1782,12 @@ def main(args):
                 args.instance_prompt, text_encoding_pipeline
             )
 
+    null_prompt_embeds = None
+    if args.conditioning_dropout_prob is not None:
+        with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
+            null_prompt_embeds, _ = compute_text_embeddings("", text_encoding_pipeline)
+        null_prompt_embeds = null_prompt_embeds.cpu()
+
     if args.validation_prompt is not None:
         validation_image = load_image(args.validation_image).convert("RGB")
         validation_kwargs = {"image": validation_image}
@@ -1969,12 +2000,25 @@ def main(args):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    def flow_matching_loss(model_input, cond_model_input, prompt_embeds, text_ids, generator=None):
+    def flow_matching_loss(
+        model_input, cond_model_input, prompt_embeds, text_ids, generator=None, conditioning_dropout_prob=None
+    ):
         model_input = Flux2KleinPipeline._patchify_latents(model_input)
         model_input = (model_input - latents_bn_mean) / latents_bn_std
 
         cond_model_input = Flux2KleinPipeline._patchify_latents(cond_model_input)
         cond_model_input = (cond_model_input - latents_bn_mean) / latents_bn_std
+
+        if conditioning_dropout_prob is not None:
+            # InstructPix2Pix schedule on one draw: text dropped for p < 2q, image dropped for q <= p < 3q.
+            # Image null = zeros in normalized latent space; the inference pipeline must use the same null.
+            bsz = model_input.shape[0]
+            random_p = torch.rand(bsz, device=model_input.device)
+            prompt_mask = (random_p < 2 * conditioning_dropout_prob).reshape(bsz, 1, 1)
+            null_embeds = null_prompt_embeds.to(prompt_embeds.device, dtype=prompt_embeds.dtype).expand_as(prompt_embeds)
+            prompt_embeds = torch.where(prompt_mask, null_embeds, prompt_embeds)
+            image_keep = (random_p < conditioning_dropout_prob) | (random_p >= 3 * conditioning_dropout_prob)
+            cond_model_input = cond_model_input * image_keep.to(cond_model_input.dtype).reshape(bsz, 1, 1, 1)
 
         model_input_ids = Flux2KleinPipeline._prepare_latent_ids(model_input).to(device=model_input.device)
         # Each batch element is an independent training sample with a single
@@ -2064,12 +2108,13 @@ def main(args):
         loss = loss.mean()
         return loss
 
-    def run_eval(step):
+    def run_eval(step, epoch):
         from torchmetrics.image import PeakSignalNoiseRatio
         from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
         transformer.eval()
         device = accelerator.device
+        table = InferenceTable(accelerator)
         # fixed noise / timesteps so val_loss is comparable across evals
         generator = torch.Generator(device="cpu").manual_seed(args.seed if args.seed is not None else 0)
         autocast_ctx = torch.autocast(device.type) if device.type != "mps" else nullcontext()
@@ -2121,9 +2166,25 @@ def main(args):
                     ).images.to(device, dtype=torch.float32)
                     if pred.shape[-2:] != target.shape[-2:]:
                         pred = F.interpolate(pred, size=target.shape[-2:], mode="bilinear", align_corners=False)
-                    mse_sum += F.mse_loss(pred, target).item()
-                    psnr.update(pred, target)
-                    lpips.update(pred, target)
+                    sample_mse = F.mse_loss(pred, target).item()
+                    sample_psnr = psnr(pred, target).item()
+                    sample_lpips = lpips(pred, target).item()
+                    mse_sum += sample_mse
+                    table.add(
+                        step=step,
+                        epoch=epoch,
+                        sample=n_done,
+                        prompt=item["prompts"][i],
+                        seed=n_done,
+                        guidance_scale=args.eval_guidance_scale,
+                        num_inference_steps=args.eval_inference_steps,
+                        source=item["cond_pixel_values"][i],
+                        target=item["pixel_values"][i],
+                        prediction=pred,
+                        mse=sample_mse,
+                        psnr=sample_psnr,
+                        lpips=sample_lpips,
+                    )
                     n_done += 1
         if n_done:
             logs.update(
@@ -2132,11 +2193,13 @@ def main(args):
 
         logger.info(f"step {step} eval: " + ", ".join(f"{k}={v:.4f}" for k, v in logs.items()))
         accelerator.log(logs, step=step)
+        table.log("eval/samples", step=step)
 
         del pipeline, psnr, lpips
         free_memory()
         transformer.train()
 
+    epoch = first_epoch  # for the post-loop run_eval when no epoch runs
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()  # weights are unfreezed here now
 
@@ -2168,7 +2231,13 @@ def main(args):
                         model_input = vae.encode(pixel_values).latent_dist.mode()
                         cond_model_input = vae.encode(cond_pixel_values).latent_dist.mode()
 
-                loss = flow_matching_loss(model_input, cond_model_input, prompt_embeds, text_ids)
+                loss = flow_matching_loss(
+                    model_input,
+                    cond_model_input,
+                    prompt_embeds,
+                    text_ids,
+                    conditioning_dropout_prob=args.conditioning_dropout_prob,
+                )
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -2217,7 +2286,7 @@ def main(args):
                                 logger.warning(f"Checkpoint upload failed: {e}")
 
                 if val_cache and accelerator.is_main_process and global_step % args.eval_steps == 0:
-                    run_eval(global_step)
+                    run_eval(global_step, epoch)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -2244,6 +2313,7 @@ def main(args):
                     accelerator=accelerator,
                     pipeline_args=validation_kwargs,
                     epoch=epoch,
+                    global_step=global_step,
                     torch_dtype=weight_dtype,
                 )
 
@@ -2251,7 +2321,7 @@ def main(args):
                 free_memory()
 
     if val_cache and accelerator.is_main_process and global_step % args.eval_steps != 0:
-        run_eval(global_step)
+        run_eval(global_step, epoch)
 
     # Save the trained transformer weights (LoRA adapters or the full model)
     accelerator.wait_for_everyone()
@@ -2337,6 +2407,7 @@ def main(args):
                     accelerator=accelerator,
                     pipeline_args=validation_kwargs,
                     epoch=epoch,
+                    global_step=global_step,
                     is_final_validation=True,
                     torch_dtype=weight_dtype,
                 )
