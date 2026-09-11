@@ -537,6 +537,21 @@ def parse_args(input_args=None):
     )
     parser.add_argument("--resolution_width", type=int, default=2048, help="Target width, see --resolution_height.")
     parser.add_argument(
+        "--input_height",
+        type=int,
+        default=None,
+        help="Canvas height. With --input_width, every training pair is first resized to this canvas; random "
+        "crops of --resolution_height x --resolution_width are then taken from it (see --random_crop_ratio).",
+    )
+    parser.add_argument("--input_width", type=int, default=None, help="Canvas width, see --input_height.")
+    parser.add_argument(
+        "--random_crop_ratio",
+        type=float,
+        default=0.0,
+        help="Per-step probability of training on a random resolution-sized window of the canvas instead of "
+        "the whole image resized to the resolution. Requires --input_height/--input_width.",
+    )
+    parser.add_argument(
         "--x_embedder_lr",
         type=float,
         default=None,
@@ -873,6 +888,18 @@ def parse_args(input_args=None):
         if val is not None and val % 16 != 0:
             raise ValueError(f"--{name} must be a multiple of 16, got {val}.")
 
+    if (args.input_height is None) != (args.input_width is None):
+        raise ValueError("--input_height and --input_width must be given together.")
+    if not 0 <= args.random_crop_ratio <= 1:
+        raise ValueError("--random_crop_ratio must be in [0, 1].")
+    if args.random_crop_ratio > 0:
+        if args.input_height is None or args.resolution_height is None:
+            raise ValueError("--random_crop_ratio requires --input_height/--input_width and --resolution_height/--resolution_width.")
+        if args.input_height < args.resolution_height or args.input_width < args.resolution_width:
+            raise ValueError("--input_height/--input_width must be at least --resolution_height/--resolution_width.")
+        if args.input_height % 8 or args.input_width % 8 or args.resolution_height % 16 or args.resolution_width % 16:
+            raise ValueError("--input_* must be multiples of 8 and --resolution_* multiples of 16 for latent-space crops.")
+
     if args.channel_concat_cond and (args.validation_prompt or args.final_validation_prompt):
         raise ValueError(
             "--channel_concat_cond changes the transformer input layout; Flux2KleinPipeline validation still "
@@ -899,6 +926,26 @@ def parse_args(input_args=None):
     return args
 
 
+def sample_crop_params():
+    """(canvas_w, canvas_h, top, left) of a random resolution-sized window on the canvas, or None to use the whole image.
+    Offsets are 16px-aligned so the window maps onto whole 2x2 latent patches."""
+    if args.random_crop_ratio > 0 and random.random() < args.random_crop_ratio:
+        max_top = args.input_height - args.resolution_height
+        max_left = args.input_width - args.resolution_width
+        top = random.randrange(0, max_top + 1, 16)
+        left = random.randrange(0, max_left + 1, 16)
+        return (args.input_width, args.input_height, top, left)
+    return None
+
+
+def crop_window(x, crop, scale=1):
+    """Cut the crop window out of a (..., H, W) pixel (scale=1) or latent (scale=8) tensor."""
+    _, _, top, left = crop
+    h, w = args.resolution_height // scale, args.resolution_width // scale
+    top, left = top // scale, left // scale
+    return x[..., top : top + h, left : left + w].contiguous()
+
+
 class DreamBoothDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
@@ -922,8 +969,12 @@ class DreamBoothDataset(Dataset):
         random_flip=None,
         original_size=None,
         crop_size=None,
+        input_size=None,
     ):
         self.size = size
+        # (height, width) canvas for random crops; canvas tensors are only built while emit_canvas is set
+        self.input_size = input_size
+        self.emit_canvas = False
         self.resolution = size
         self.center_crop = center_crop
         self.random_flip = args.random_flip if random_flip is None else random_flip
@@ -1103,14 +1154,29 @@ class DreamBoothDataset(Dataset):
     def __len__(self):
         return self._length
 
+    def _canvas_tensor(self, image):
+        image = exif_transpose(image)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        canvas = (self.input_size[1], self.input_size[0])
+        if image.size != canvas:
+            image = image.resize(canvas, Image.LANCZOS)
+        return TF.normalize(TF.to_tensor(image), [0.5], [0.5])
+
     def __getitem__(self, index):
         example = {}
-        instance_image, bucket_idx = self.pixel_values[index % self.num_instance_images]
+        idx = index % self.num_instance_images
+        instance_image, bucket_idx = self.pixel_values[idx]
         example["instance_images"] = instance_image
+        example["index"] = idx
         example["bucket_idx"] = bucket_idx
         if self.cond_pixel_values:
-            dest_image, _ = self.cond_pixel_values[index % self.num_instance_images]
+            dest_image, _ = self.cond_pixel_values[idx]
             example["cond_images"] = dest_image
+        if self.emit_canvas and self.input_size is not None:
+            example["canvas_images"] = self._canvas_tensor(self.instance_images[idx])
+            if self.cond_images:
+                example["canvas_cond_images"] = self._canvas_tensor(self.cond_images[idx])
 
         if self.custom_instance_prompts:
             caption = self.custom_instance_prompts[index % self.num_instance_images]
@@ -1187,12 +1253,15 @@ def collate_fn(examples):
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    batch = {"pixel_values": pixel_values, "prompts": prompts}
+    batch = {"pixel_values": pixel_values, "prompts": prompts, "indices": [example["index"] for example in examples]}
     if any("cond_images" in example for example in examples):
         cond_pixel_values = [example["cond_images"] for example in examples]
         cond_pixel_values = torch.stack(cond_pixel_values)
         cond_pixel_values = cond_pixel_values.to(memory_format=torch.contiguous_format).float()
         batch.update({"cond_pixel_values": cond_pixel_values})
+    for key, out in (("canvas_images", "canvas_pixel_values"), ("canvas_cond_images", "canvas_cond_pixel_values")):
+        if all(key in example for example in examples):
+            batch[out] = torch.stack([example[key] for example in examples]).float()
     return batch
 
 
@@ -1784,7 +1853,10 @@ def main(args):
         split_seed=args.val_split_seed,
         original_size=original_size,
         crop_size=train_crop_size,
+        input_size=(args.input_height, args.input_width) if args.random_crop_ratio > 0 else None,
     )
+    if train_dataset.input_size is not None and len(train_dataset.buckets) != 1:
+        raise ValueError("--random_crop_ratio needs a single fixed resolution bucket.")
     val_dataset = None
     if args.val_split_ratio > 0:
         val_dataset = DreamBoothDataset(
@@ -1803,12 +1875,14 @@ def main(args):
             crop_size=val_crop_size,
         )
         logger.info(f"Validation split: {len(val_dataset)} pairs held out from training.")
-    has_step_indexed_caches = precompute_latents = args.cache_latents or train_dataset.custom_instance_prompts
+    # Caches are keyed by dataset index (carried in batch["indices"]), so they survive dataloader
+    # sharding across ranks and per-epoch reshuffling.
+    precompute_latents = args.cache_latents or train_dataset.custom_instance_prompts
     batch_sampler = BucketBatchSampler(
         train_dataset,
         batch_size=args.train_batch_size,
         drop_last=True,
-        shuffle_batches_each_epoch=not has_step_indexed_caches,
+        shuffle_batches_each_epoch=True,
     )
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -1884,33 +1958,50 @@ def main(args):
         text_ids = instance_text_ids
 
     # if cache_latents is set to True, we encode images to latents and store them.
+    # Caches live on CPU: ~700 pairs/rank at 2K would take ~10GB of GPU that the 4B fp32 finetune needs.
     # Similar to pre-encoding in the case of a single instance prompt, if custom prompts are provided
     # we encode them in advance as well.
     if precompute_latents:
-        prompt_embeds_cache = []
-        text_ids_cache = []
-        latents_cache = []
-        cond_latents_cache = []
+        prompt_embeds_cache = {}
+        text_ids_cache = {}
+        latents_cache = {}
+        cond_latents_cache = {}
+        canvas_latents_cache = {}
+        canvas_cond_latents_cache = {}
+        train_dataset.emit_canvas = train_dataset.input_size is not None
+
+        def store(cache, indices, values):
+            for i, v in zip(indices, values.cpu()):
+                cache[i] = v
+
         for batch in tqdm(train_dataloader, desc="Caching latents"):
+            indices = batch["indices"]
             with torch.no_grad():
                 if args.cache_latents:
                     with offload_models(vae, device=accelerator.device, offload=args.offload):
-                        batch["pixel_values"] = batch["pixel_values"].to(
-                            accelerator.device, non_blocking=True, dtype=vae.dtype
-                        )
-                        latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
-                        batch["cond_pixel_values"] = batch["cond_pixel_values"].to(
-                            accelerator.device, non_blocking=True, dtype=vae.dtype
-                        )
-                        cond_latents_cache.append(vae.encode(batch["cond_pixel_values"]).latent_dist)
+                        pixels = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=vae.dtype)
+                        store(latents_cache, indices, vae.encode(pixels).latent_dist.mode())
+                        pixels = batch["cond_pixel_values"].to(accelerator.device, non_blocking=True, dtype=vae.dtype)
+                        store(cond_latents_cache, indices, vae.encode(pixels).latent_dist.mode())
+                        if "canvas_pixel_values" in batch:
+                            canvas = batch["canvas_pixel_values"].to(accelerator.device, dtype=vae.dtype)
+                            store(canvas_latents_cache, indices, vae.encode(canvas).latent_dist.mode())
+                            canvas = batch["canvas_cond_pixel_values"].to(accelerator.device, dtype=vae.dtype)
+                            store(canvas_cond_latents_cache, indices, vae.encode(canvas).latent_dist.mode())
                 if train_dataset.custom_instance_prompts:
                     if args.fsdp_text_encoder:
                         prompt_embeds, text_ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
                     else:
                         with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
                             prompt_embeds, text_ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
-                    prompt_embeds_cache.append(prompt_embeds)
-                    text_ids_cache.append(text_ids)
+                    store(prompt_embeds_cache, indices, prompt_embeds)
+                    store(text_ids_cache, indices, text_ids)
+
+        def gather(cache, indices):
+            return torch.stack([cache[i] for i in indices]).to(accelerator.device)
+
+    # Without cached latents the random crop is cut from canvas pixels each step, so keep emitting them.
+    train_dataset.emit_canvas = train_dataset.input_size is not None and not args.cache_latents
 
     # Validation pairs are always cached (latents, embeddings, pixels) so eval never needs the VAE or text encoder.
     val_cache = []
@@ -2328,25 +2419,31 @@ def main(args):
 
             with accelerator.accumulate(models_to_accumulate):
                 if train_dataset.custom_instance_prompts:
-                    prompt_embeds = prompt_embeds_cache[step]
-                    text_ids = text_ids_cache[step]
+                    prompt_embeds = gather(prompt_embeds_cache, batch["indices"])
+                    text_ids = gather(text_ids_cache, batch["indices"])
                 else:
                     num_repeat_elements = len(prompts)
                     prompt_embeds = prompt_embeds.repeat(num_repeat_elements, 1, 1)
                     text_ids = text_ids.repeat(num_repeat_elements, 1, 1)
 
                 # Convert images to latent space
+                crop = sample_crop_params()
                 if args.cache_latents:
-                    model_input = latents_cache[step].mode()
-                    cond_model_input = cond_latents_cache[step].mode()
+                    if crop is not None:
+                        model_input = crop_window(gather(canvas_latents_cache, batch["indices"]), crop, scale=8)
+                        cond_model_input = crop_window(gather(canvas_cond_latents_cache, batch["indices"]), crop, scale=8)
+                    else:
+                        model_input = gather(latents_cache, batch["indices"])
+                        cond_model_input = gather(cond_latents_cache, batch["indices"])
                 else:
                     with offload_models(vae, device=accelerator.device, offload=args.offload):
-                        pixel_values = batch["pixel_values"].to(
-                            device=accelerator.device, dtype=vae.dtype
-                        )  # input / pixel image
-                        cond_pixel_values = batch["cond_pixel_values"].to(
-                            device=accelerator.device, dtype=vae.dtype
-                        )  # output / conditional values
+                        if crop is not None:
+                            pixel_values = crop_window(batch["canvas_pixel_values"], crop)
+                            cond_pixel_values = crop_window(batch["canvas_cond_pixel_values"], crop)
+                        else:
+                            pixel_values, cond_pixel_values = batch["pixel_values"], batch["cond_pixel_values"]
+                        pixel_values = pixel_values.to(device=accelerator.device, dtype=vae.dtype)  # target / edited
+                        cond_pixel_values = cond_pixel_values.to(device=accelerator.device, dtype=vae.dtype)  # source
                         model_input = vae.encode(pixel_values).latent_dist.mode()
                         cond_model_input = vae.encode(cond_pixel_values).latent_dist.mode()
 
@@ -2414,7 +2511,7 @@ def main(args):
                     except Exception as e:
                         logger.error(f"eval at step {global_step} failed, training continues: {e}", exc_info=True)
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "random_crop": float(crop is not None)}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
