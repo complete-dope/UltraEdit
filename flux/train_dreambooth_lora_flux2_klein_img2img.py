@@ -2026,6 +2026,15 @@ def main(args):
             # Get the mos recent checkpoint
             dirs = os.listdir(args.output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
+            # a run killed mid-save leaves a stub directory behind; it is not resumable
+            dirs = [
+                d
+                for d in dirs
+                if os.path.exists(os.path.join(args.output_dir, d, "pytorch_model_fsdp.bin"))
+                or os.path.exists(
+                    os.path.join(args.output_dir, d, "transformer", "diffusion_pytorch_model.safetensors")
+                )
+            ]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
 
@@ -2037,8 +2046,24 @@ def main(args):
             initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            ckpt_dir = os.path.join(args.output_dir, path)
             global_step = int(path.split("-")[1])
+            has_opt = any(
+                os.path.exists(os.path.join(ckpt_dir, f)) for f in ("optimizer.bin", "optimizer_0", "optimizer_0.bin")
+            )
+            if has_opt:
+                accelerator.load_state(ckpt_dir)
+            elif is_fsdp:
+                # optimizer state was stripped to stay inside the disk quota: take the weights,
+                # rebuild the moments from scratch and fast-forward the LR schedule
+                logger.warning(f"{path} has no optimizer state; resuming weights-only")
+                from accelerate.utils import load_fsdp_model
+
+                load_fsdp_model(accelerator.state.fsdp_plugin, accelerator, transformer, ckpt_dir, 0)
+                for _ in range(global_step):
+                    lr_scheduler.step()
+            else:
+                accelerator.load_state(ckpt_dir)
 
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
@@ -2347,15 +2372,14 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
 
-                if accelerator.is_main_process or is_fsdp:
-                    if global_step % args.checkpointing_steps == 0:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
+                if global_step % args.checkpointing_steps == 0:
+                    # Retention has exactly one owner: rank 0. Never let it kill the run.
+                    if accelerator.is_main_process and args.checkpoints_total_limit is not None:
+                        try:
                             checkpoints = os.listdir(args.output_dir)
                             checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
                             if len(checkpoints) >= args.checkpoints_total_limit:
                                 num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
                                 removing_checkpoints = checkpoints[0:num_to_remove]
@@ -2367,17 +2391,22 @@ def main(args):
 
                                 for removing_checkpoint in removing_checkpoints:
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
+                                    shutil.rmtree(removing_checkpoint, ignore_errors=True)
+                        except Exception as e:
+                            logger.warning(f"checkpoint retention failed, training continues: {e}")
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
-                        if args.push_checkpoints_to_hub and accelerator.is_main_process:
-                            try:
-                                push_checkpoint_to_hub(save_path)
-                            except Exception as e:
-                                # never let a flaky upload kill a training run
-                                logger.warning(f"Checkpoint upload failed: {e}")
+                    accelerator.wait_for_everyone()
+
+                if (accelerator.is_main_process or is_fsdp) and global_step % args.checkpointing_steps == 0:
+                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    accelerator.save_state(save_path)
+                    logger.info(f"Saved state to {save_path}")
+                    if args.push_checkpoints_to_hub and accelerator.is_main_process:
+                        try:
+                            push_checkpoint_to_hub(save_path)
+                        except Exception as e:
+                            # never let a flaky upload kill a training run
+                            logger.warning(f"Checkpoint upload failed: {e}")
 
                 if val_cache and (accelerator.is_main_process or is_fsdp) and global_step % args.eval_steps == 0:
                     try:

@@ -1,3 +1,7 @@
+# NOTE: this pins the upstream SD3/SDXL stack for traning/train_sd3_pix2pix.py and
+# traning/train_sdxl_pix2pix.py (with `cd diffusers && pip install -e .`).
+# The FLUX.2 klein scripts in flux/ need a DIFFERENT, incompatible stack -- see
+# flux/requirements.txt and use a separate venv for them.
 accelerate==0.31.0
 clip @ git+https://github.com/openai/CLIP.git@dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1
 datasets==2.20.0

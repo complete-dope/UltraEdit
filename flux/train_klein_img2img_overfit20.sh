@@ -14,8 +14,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 MODEL="/workspace/models/FLUX.2-klein-base-4B"
 DATASET_PATH="/workspace/datasets/exteriors-v5-overfit20"   # save_to_disk folder, 20 rows
-OUTPUT_DIR="/workspace/runs/klein-base-4b-overfit20"
-RUN_NAME="klein-base-4b-overfit20"
+OUTPUT_DIR="/workspace/runs/klein-base-4b-overfit20-20k"
+RUN_NAME="klein-base-4b-overfit20-20k"
 
 ARGS=(
   # ---------------- model / data ----------------
@@ -50,7 +50,7 @@ ARGS=(
   --train_batch_size 1
   --sample_batch_size 4
   --gradient_accumulation_steps 1          # 1 so 5000 steps == 5000 real updates
-  --max_train_steps 5000
+  --max_train_steps 20000
   --learning_rate 1e-5                     # full finetune of 4B params: keep the LR low
   --x_embedder_lr 1e-3                     # cond half is zero-init; at 1e-5 it never becomes usable
   --lr_scheduler constant
@@ -76,6 +76,7 @@ ARGS=(
   --dataloader_num_workers 2
   --checkpointing_steps 250
   --checkpoints_total_limit 3
+  --resume_from_checkpoint latest
   --report_to wandb
   --logging_dir logs
   # no --push_to_hub: checkpoints stay local in $OUTPUT_DIR
