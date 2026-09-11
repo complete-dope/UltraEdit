@@ -2358,6 +2358,8 @@ def main(args):
                     else:
                         pred = pipeline(
                             image=cond_image,
+                            height=target.shape[-2],
+                            width=target.shape[-1],
                             prompt_embeds=item["prompt_embeds"][i : i + 1].to(device),
                             negative_prompt_embeds=val_negative_prompt_embeds.to(device),
                             num_inference_steps=args.eval_inference_steps,
@@ -2366,6 +2368,7 @@ def main(args):
                             output_type="pt",
                         ).images.to(device, dtype=torch.float32)
                     if pred.shape[-2:] != target.shape[-2:]:
+                        logger.warning(f"eval pred {tuple(pred.shape[-2:])} != target {tuple(target.shape[-2:])}, resizing")
                         pred = F.interpolate(pred, size=target.shape[-2:], mode="bilinear", align_corners=False)
                     sample_mse = F.mse_loss(pred, target).item()
                     sample_psnr = psnr(pred, target).item()
@@ -2403,7 +2406,7 @@ def main(args):
 
         logger.info(f"step {step} eval: " + ", ".join(f"{k}={v:.4f}" for k, v in logs.items()))
         accelerator.log(logs, step=step)
-        table.log("eval/samples", step=step)
+        table.log("eval_table/samples", step=step)
 
         del pipeline, psnr, lpips
         free_memory()
@@ -2653,7 +2656,8 @@ def main(args):
                 repo_id=repo_id,
                 folder_path=args.output_dir,
                 commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
+                # checkpoint-* already lives under checkpoints/ via --push_checkpoints_to_hub
+                ignore_patterns=["step_*", "epoch_*", "checkpoint-*", "logs/*"],
             )
 
     accelerator.end_training()

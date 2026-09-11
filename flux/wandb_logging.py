@@ -126,21 +126,21 @@ class InferenceTable:
             ]
         )
 
+    # One INCREMENTAL table per key, shared across evals, so every step's rows land in the same panel.
+    _tables = {}
+
     def log(self, key, step):
         if not self.enabled or not self.rows:
             return
-        table = wandb.Table(columns=self.COLUMNS)
+        table = self._tables.get(key)
+        if table is None:
+            table = wandb.Table(columns=self.COLUMNS, log_mode="INCREMENTAL")
+            self._tables[key] = table
         for row in self.rows:
             table.add_data(*row)
-        # wandb 0.30 drops media nested in a Table, so log the images as plain panels too
         payload = {key: table}
-        for label, idx in (("source", 7), ("target", 8), ("prediction", 9)):
-            imgs = [r[idx] for r in self.rows if r[idx] is not None]
-            if imgs:
-                payload[f"{key}/{label}"] = imgs
         if self.strips:
-            # one panel with source | target | prediction side by side, easiest to eyeball across steps
-            payload[f"{key}/compare"] = self.strips
+            payload[f"{key}_compare"] = self.strips
         self.tracker.log(payload, step=step)
         self.rows = []
         self.strips = []
