@@ -803,12 +803,6 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--cache_latents",
-        action="store_true",
-        default=False,
-        help="Cache the VAE latents",
-    )
-    parser.add_argument(
         "--report_to",
         type=str,
         default="tensorboard",
@@ -938,11 +932,10 @@ def sample_crop_params():
     return None
 
 
-def crop_window(x, crop, scale=1):
-    """Cut the crop window out of a (..., H, W) pixel (scale=1) or latent (scale=8) tensor."""
+def crop_window(x, crop):
+    """Cut the crop window out of a (..., H, W) pixel tensor."""
     _, _, top, left = crop
-    h, w = args.resolution_height // scale, args.resolution_width // scale
-    top, left = top // scale, left // scale
+    h, w = args.resolution_height, args.resolution_width
     return x[..., top : top + h, left : left + w].contiguous()
 
 
@@ -1877,7 +1870,7 @@ def main(args):
         logger.info(f"Validation split: {len(val_dataset)} pairs held out from training.")
     # Caches are keyed by dataset index (carried in batch["indices"]), so they survive dataloader
     # sharding across ranks and per-epoch reshuffling.
-    precompute_latents = args.cache_latents or train_dataset.custom_instance_prompts
+    precompute_prompts = bool(train_dataset.custom_instance_prompts)
     batch_sampler = BucketBatchSampler(
         train_dataset,
         batch_size=args.train_batch_size,
@@ -1957,51 +1950,33 @@ def main(args):
         prompt_embeds = instance_prompt_hidden_states
         text_ids = instance_text_ids
 
-    # if cache_latents is set to True, we encode images to latents and store them.
-    # Caches live on CPU: ~700 pairs/rank at 2K would take ~10GB of GPU that the 4B fp32 finetune needs.
-    # Similar to pre-encoding in the case of a single instance prompt, if custom prompts are provided
-    # we encode them in advance as well.
-    if precompute_latents:
+    # Only text embeddings are cached. Image latents are never cached: every step VAE-encodes either the
+    # full resized pair or a fresh pixel-space crop of the canvas.
+    if precompute_prompts:
         prompt_embeds_cache = {}
         text_ids_cache = {}
-        latents_cache = {}
-        cond_latents_cache = {}
-        canvas_latents_cache = {}
-        canvas_cond_latents_cache = {}
-        train_dataset.emit_canvas = train_dataset.input_size is not None
+        train_dataset.emit_canvas = False
 
         def store(cache, indices, values):
             for i, v in zip(indices, values.cpu()):
                 cache[i] = v
 
-        for batch in tqdm(train_dataloader, desc="Caching latents"):
+        for batch in tqdm(train_dataloader, desc="Caching prompt embeddings"):
             indices = batch["indices"]
             with torch.no_grad():
-                if args.cache_latents:
-                    with offload_models(vae, device=accelerator.device, offload=args.offload):
-                        pixels = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=vae.dtype)
-                        store(latents_cache, indices, vae.encode(pixels).latent_dist.mode())
-                        pixels = batch["cond_pixel_values"].to(accelerator.device, non_blocking=True, dtype=vae.dtype)
-                        store(cond_latents_cache, indices, vae.encode(pixels).latent_dist.mode())
-                        if "canvas_pixel_values" in batch:
-                            canvas = batch["canvas_pixel_values"].to(accelerator.device, dtype=vae.dtype)
-                            store(canvas_latents_cache, indices, vae.encode(canvas).latent_dist.mode())
-                            canvas = batch["canvas_cond_pixel_values"].to(accelerator.device, dtype=vae.dtype)
-                            store(canvas_cond_latents_cache, indices, vae.encode(canvas).latent_dist.mode())
-                if train_dataset.custom_instance_prompts:
-                    if args.fsdp_text_encoder:
+                if args.fsdp_text_encoder:
+                    prompt_embeds, text_ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
+                else:
+                    with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
                         prompt_embeds, text_ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
-                    else:
-                        with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
-                            prompt_embeds, text_ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
-                    store(prompt_embeds_cache, indices, prompt_embeds)
-                    store(text_ids_cache, indices, text_ids)
+                store(prompt_embeds_cache, indices, prompt_embeds)
+                store(text_ids_cache, indices, text_ids)
 
         def gather(cache, indices):
             return torch.stack([cache[i] for i in indices]).to(accelerator.device)
 
-    # Without cached latents the random crop is cut from canvas pixels each step, so keep emitting them.
-    train_dataset.emit_canvas = train_dataset.input_size is not None and not args.cache_latents
+    # The random crop is cut from canvas pixels each step, so emit them during training.
+    train_dataset.emit_canvas = train_dataset.input_size is not None
 
     # Validation pairs are always cached (latents, embeddings, pixels) so eval never needs the VAE or text encoder.
     val_cache = []
@@ -2036,11 +2011,6 @@ def main(args):
                     ids = instance_text_ids.repeat(len(batch["prompts"]), 1, 1)
                 item["prompt_embeds"], item["text_ids"] = embeds.cpu(), ids.cpu()
                 val_cache.append(item)
-
-    # move back to cpu before deleting to ensure memory is freed see: https://github.com/huggingface/diffusers/issues/11376#issue-3008144624
-    if args.cache_latents:
-        vae = vae.to("cpu")
-        del vae
 
     # move back to cpu before deleting to ensure memory is freed see: https://github.com/huggingface/diffusers/issues/11376#issue-3008144624
     text_encoding_pipeline = text_encoding_pipeline.to("cpu")
@@ -2429,26 +2399,18 @@ def main(args):
                     prompt_embeds = prompt_embeds.repeat(num_repeat_elements, 1, 1)
                     text_ids = text_ids.repeat(num_repeat_elements, 1, 1)
 
-                # Convert images to latent space
+                # Pick random crop or full image, then VAE-encode the pixels live for this step
                 crop = sample_crop_params()
-                if args.cache_latents:
+                with offload_models(vae, device=accelerator.device, offload=args.offload):
                     if crop is not None:
-                        model_input = crop_window(gather(canvas_latents_cache, batch["indices"]), crop, scale=8)
-                        cond_model_input = crop_window(gather(canvas_cond_latents_cache, batch["indices"]), crop, scale=8)
+                        pixel_values = crop_window(batch["canvas_pixel_values"], crop)
+                        cond_pixel_values = crop_window(batch["canvas_cond_pixel_values"], crop)
                     else:
-                        model_input = gather(latents_cache, batch["indices"])
-                        cond_model_input = gather(cond_latents_cache, batch["indices"])
-                else:
-                    with offload_models(vae, device=accelerator.device, offload=args.offload):
-                        if crop is not None:
-                            pixel_values = crop_window(batch["canvas_pixel_values"], crop)
-                            cond_pixel_values = crop_window(batch["canvas_cond_pixel_values"], crop)
-                        else:
-                            pixel_values, cond_pixel_values = batch["pixel_values"], batch["cond_pixel_values"]
-                        pixel_values = pixel_values.to(device=accelerator.device, dtype=vae.dtype)  # target / edited
-                        cond_pixel_values = cond_pixel_values.to(device=accelerator.device, dtype=vae.dtype)  # source
-                        model_input = vae.encode(pixel_values).latent_dist.mode()
-                        cond_model_input = vae.encode(cond_pixel_values).latent_dist.mode()
+                        pixel_values, cond_pixel_values = batch["pixel_values"], batch["cond_pixel_values"]
+                    pixel_values = pixel_values.to(device=accelerator.device, dtype=vae.dtype)  # target / edited
+                    cond_pixel_values = cond_pixel_values.to(device=accelerator.device, dtype=vae.dtype)  # source
+                    model_input = vae.encode(pixel_values).latent_dist.mode()
+                    cond_model_input = vae.encode(cond_pixel_values).latent_dist.mode()
 
                 loss = flow_matching_loss(
                     model_input,

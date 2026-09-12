@@ -72,7 +72,7 @@ ARGS=(
 # --gradient_checkpointing                 # off: trade VRAM for speed, and its recompute pass
                                            # returns fp32 tensors under autocast (CheckpointError)
   --allow_tf32
-  --cache_latents                          # 20 images: encode once, then drop the VAE
+  # image latents never cached: VAE encodes live each step (random crop or full resize)
   --dataloader_num_workers 2
   --checkpointing_steps 250
   --checkpoints_total_limit 3

@@ -77,7 +77,6 @@ ARGS=(
   --transformer_dtype fp32
 # --gradient_checkpointing
   --allow_tf32
-  --cache_latents
   --dataloader_num_workers 2
   --checkpointing_steps 500
   --checkpoints_total_limit 3
