@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-source /workspace/UltraEdit/.venv/bin/activate
+source /workspace/venv/bin/activate
 export HF_HOME=/workspace/hf_home
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -20,6 +20,10 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
 fi
 [[ -n "$HF_TOKEN" ]] || { echo "HF_TOKEN not set and not found in ~/.bashrc"; exit 1; }
 export HF_TOKEN
+if [[ -z "${WANDB_API_KEY:-}" ]]; then
+  WANDB_API_KEY="$(grep -oP '^export WANDB_API_KEY=\K\S+' ~/.bashrc || true)"
+fi
+export WANDB_API_KEY
 
 if [[ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]]; then
   echo "GPUs busy:"; nvidia-smi --query-compute-apps=pid,used_memory --format=csv; exit 1
@@ -53,11 +57,11 @@ ARGS=(
 # --rank 32                                # ignored in full mode
   --output_dir "$OUTPUT_DIR"
   --seed 42
-  --train_batch_size 1 
+  --train_batch_size 8 # per GPU; 8 x 3 accum x 3 GPUs = 72 images per update (12 x 2 OOMed at step 53)
   --sample_batch_size 4
-  --gradient_accumulation_steps 32 # followed from OG script
-  --max_train_steps 10000 
-  --learning_rate 1e-5 # full finetune of 4B params
+  --gradient_accumulation_steps 3 # 8 x 3 x 3 GPUs = 72
+  --max_train_steps 20000 
+  --learning_rate 1e-5 # full finetune of transformer 4B params
   --x_embedder_lr 1e-3 # cond half is zero-init; at 1e-5 it never becomes usable
   --lr_scheduler cosine
   --lr_warmup_steps 400
@@ -75,9 +79,9 @@ ARGS=(
   --mode_scale 1.29
   --mixed_precision bf16
   --transformer_dtype fp32
-# --gradient_checkpointing
+  --gradient_checkpointing # mandatory: one 2048x1360 sample needs >60GB of activations without it
   --allow_tf32
-  --dataloader_num_workers 2
+  --dataloader_num_workers 4
   --checkpointing_steps 500
   --checkpoints_total_limit 3
   --resume_from_checkpoint latest

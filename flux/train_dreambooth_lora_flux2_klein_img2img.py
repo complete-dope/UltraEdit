@@ -37,8 +37,11 @@ import copy
 import itertools
 import json
 import logging
+import hashlib
 import math
+import multiprocessing as mp
 import os
+import time
 import random
 import shutil
 from contextlib import nullcontext
@@ -939,6 +942,51 @@ def crop_window(x, crop):
     return x[..., top : top + h, left : left + w].contiguous()
 
 
+def to_pixels(x, device=None, dtype=None):
+    if x.dtype == torch.uint8:
+        return x.to(device=device, dtype=dtype or torch.float32).div_(127.5).sub_(1.0)
+    return x.to(device=device, dtype=dtype)
+
+
+_PAIR_POOL = {}
+
+
+def _u8_chw(arr):
+    return torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1)
+
+
+def _preprocess_pair(job):
+    # Forked worker: decode, resize, crop, and write uint8 pixels into the shared memmaps.
+    j, i = job
+    p = _PAIR_POOL
+    row = p["dataset"][i]
+    image = exif_transpose(row[p["image_column"]]).convert("RGB")
+    dest = exif_transpose(row[p["cond_column"]]).convert("RGB") if p["cond_column"] else None
+    canonical, canvas_wh = p["canonical"], p["canvas_wh"]
+    if canonical is not None and image.size != canonical:
+        image = image.resize(canonical, Image.LANCZOS)
+    if canonical is not None and dest is not None and dest.size != canonical:
+        dest = dest.resize(canonical, Image.LANCZOS)
+    if p["canvas"] is not None:
+        p["canvas"][j] = np.asarray(image if image.size == canvas_wh else image.resize(canvas_wh, Image.LANCZOS))
+        if dest is not None:
+            p["canvas_cond"][j] = np.asarray(dest if dest.size == canvas_wh else dest.resize(canvas_wh, Image.LANCZOS))
+    image, dest = DreamBoothDataset.paired_transform(
+        None,
+        image,
+        dest_image=dest,
+        size=p["target"],
+        center_crop=p["center_crop"],
+        random_flip=p["random_flip"],
+        resize=p["resize"],
+        to_tensor=False,
+    )
+    p["crops"][j] = np.asarray(image)
+    if dest is not None:
+        p["crops_cond"][j] = np.asarray(dest)
+    return j
+
+
 class DreamBoothDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
@@ -974,6 +1022,8 @@ class DreamBoothDataset(Dataset):
         # (height, width). When crop_size is set the pair is cropped to it with no resize.
         self.original_size = original_size
         self.crop_size = crop_size
+        # Fixed canvas + crop geometry: decode and resize in a process pool instead of one image at a time.
+        self._fast = False
 
         self.instance_prompt = instance_prompt
         self.custom_instance_prompts = None
@@ -1031,12 +1081,17 @@ class DreamBoothDataset(Dataset):
                     raise ValueError(
                         f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
                     )
-            instance_images = dataset["train"][image_column]
-            cond_images = None
             cond_image_column = args.cond_image_column
-            if cond_image_column is not None:
-                cond_images = [dataset["train"][i][cond_image_column] for i in range(len(dataset["train"]))]
-                assert len(instance_images) == len(cond_images)
+            fixed_bucket = self._explicit_buckets is not None and len(self._explicit_buckets) == 1
+            self._fast = self.crop_size is not None or (fixed_bucket and not self.use_aspect_ratio_buckets)
+            instance_images, cond_images = [], None
+            if self._fast:
+                self._preprocess_parallel(dataset["train"], image_column, cond_image_column, repeats)
+            else:
+                instance_images = dataset["train"][image_column]
+                if cond_image_column is not None:
+                    cond_images = [dataset["train"][i][cond_image_column] for i in range(len(dataset["train"]))]
+                    assert len(instance_images) == len(cond_images)
 
             if args.caption_column is None:
                 logger.info(
@@ -1141,11 +1196,95 @@ class DreamBoothDataset(Dataset):
             if dest_image is not None:
                 self.cond_pixel_values.append((dest_image, bucket_idx))
 
-        self.num_instance_images = len(self.instance_images)
+        if self._fast:
+            target, n, has_cond = self._fast_layout
+            self.buckets = [target]
+            self.pixel_values = [(j, 0) for j in range(n)]
+            self.cond_pixel_values = [(j, 0) for j in range(n)] if has_cond else []
+            self.num_instance_images = n
+        else:
+            self.num_instance_images = len(self.instance_images)
         self._length = self.num_instance_images
 
     def __len__(self):
         return self._length
+
+    def _preprocess_parallel(self, dataset, image_column, cond_column, repeats):
+        # Pixels live as uint8 memmaps in shared memory: built once by local rank 0, mapped read-only by every
+        # rank and DataLoader worker, and reused by later runs with the same dataset fingerprint and geometry.
+        src = [i for i in range(len(dataset)) for _ in range(repeats)]
+        n = len(src)
+        target = self.crop_size if self.crop_size is not None else tuple(self._explicit_buckets[0])
+        ch, cw = target
+        canonical = None if self.original_size is None else (self.original_size[1], self.original_size[0])
+        canvas_wh = None if self.input_size is None else (self.input_size[1], self.input_size[0])
+        shapes = {"crops": (n, ch, cw, 3)}
+        if cond_column:
+            shapes["crops_cond"] = (n, ch, cw, 3)
+        if canvas_wh is not None:
+            shapes["canvas"] = (n, canvas_wh[1], canvas_wh[0], 3)
+            if cond_column:
+                shapes["canvas_cond"] = (n, canvas_wh[1], canvas_wh[0], 3)
+        spec = [dataset._fingerprint, image_column, cond_column, repeats, target, canvas_wh, canonical,
+                self.center_crop, self.random_flip, sorted(shapes.items())]
+        key = hashlib.sha1(json.dumps(spec, default=str).encode()).hexdigest()[:16]
+        cache_dir = Path(os.environ.get("PIXEL_CACHE_DIR", "/dev/shm/klein_pixel_cache")) / key
+        done = cache_dir / "done"
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if local_rank == 0 and not done.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            cache_dir.mkdir(parents=True)
+            arrays = {
+                k: np.lib.format.open_memmap(cache_dir / f"{k}.npy", mode="w+", dtype=np.uint8, shape=shp)
+                for k, shp in shapes.items()
+            }
+            _PAIR_POOL.update(
+                dataset=dataset,
+                image_column=image_column,
+                cond_column=cond_column,
+                canonical=canonical,
+                canvas_wh=canvas_wh,
+                target=target,
+                resize=self.crop_size is None,
+                center_crop=self.center_crop,
+                random_flip=self.random_flip,
+                crops=arrays["crops"],
+                crops_cond=arrays.get("crops_cond"),
+                canvas=arrays.get("canvas"),
+                canvas_cond=arrays.get("canvas_cond"),
+            )
+            workers = max(1, min(64, (os.cpu_count() or 1) - 8, n))
+            with mp.get_context("fork").Pool(workers) as pool:
+                for _ in tqdm(
+                    pool.imap_unordered(_preprocess_pair, list(enumerate(src)), chunksize=2),
+                    total=n,
+                    desc=f"Building pixel cache {cache_dir} ({workers} procs)",
+                ):
+                    pass
+            _PAIR_POOL.clear()
+            for a in arrays.values():
+                a.flush()
+            del arrays
+            done.touch()
+        else:
+            waited = 0
+            while not done.exists():
+                time.sleep(2)
+                waited += 2
+                if waited > 7200:
+                    raise RuntimeError(f"Timed out waiting for pixel cache {cache_dir}")
+        arrays = {k: np.load(cache_dir / f"{k}.npy", mmap_mode="r") for k in shapes}
+        for k, shp in shapes.items():
+            if arrays[k].shape != shp:
+                raise RuntimeError(f"Pixel cache {cache_dir}/{k}.npy has shape {arrays[k].shape}, expected {shp}")
+        self._crops = arrays["crops"]
+        self._crops_cond = arrays.get("crops_cond")
+        self._canvas = arrays.get("canvas")
+        self._canvas_cond = arrays.get("canvas_cond")
+        gb = sum(a.nbytes for a in arrays.values()) / 1024**3
+        if local_rank == 0:
+            print(f"Pixel cache ready: {cache_dir} ({n} pairs, {gb:.1f} GB shared)")
+        self._fast_layout = (target, n, bool(cond_column))
 
     def _canvas_tensor(self, image):
         image = exif_transpose(image)
@@ -1159,17 +1298,27 @@ class DreamBoothDataset(Dataset):
     def __getitem__(self, index):
         example = {}
         idx = index % self.num_instance_images
-        instance_image, bucket_idx = self.pixel_values[idx]
-        example["instance_images"] = instance_image
         example["index"] = idx
-        example["bucket_idx"] = bucket_idx
-        if self.cond_pixel_values:
-            dest_image, _ = self.cond_pixel_values[idx]
-            example["cond_images"] = dest_image
-        if self.emit_canvas and self.input_size is not None:
-            example["canvas_images"] = self._canvas_tensor(self.instance_images[idx])
-            if self.cond_images:
-                example["canvas_cond_images"] = self._canvas_tensor(self.cond_images[idx])
+        if self._fast:
+            example["instance_images"] = _u8_chw(self._crops[idx])
+            example["bucket_idx"] = 0
+            if self._crops_cond is not None:
+                example["cond_images"] = _u8_chw(self._crops_cond[idx])
+            if self.emit_canvas and self._canvas is not None:
+                example["canvas_images"] = _u8_chw(self._canvas[idx])
+                if self._canvas_cond is not None:
+                    example["canvas_cond_images"] = _u8_chw(self._canvas_cond[idx])
+        else:
+            instance_image, bucket_idx = self.pixel_values[idx]
+            example["instance_images"] = instance_image
+            example["bucket_idx"] = bucket_idx
+            if self.cond_pixel_values:
+                dest_image, _ = self.cond_pixel_values[idx]
+                example["cond_images"] = dest_image
+            if self.emit_canvas and self.input_size is not None:
+                example["canvas_images"] = self._canvas_tensor(self.instance_images[idx])
+                if self.cond_images:
+                    example["canvas_cond_images"] = self._canvas_tensor(self.cond_images[idx])
 
         if self.custom_instance_prompts:
             caption = self.custom_instance_prompts[index % self.num_instance_images]
@@ -1201,7 +1350,7 @@ class DreamBoothDataset(Dataset):
         return (self.resolution, self.resolution)
 
     def paired_transform(
-        self, image, dest_image=None, size=(224, 224), center_crop=False, random_flip=False, resize=True
+        self, image, dest_image=None, size=(224, 224), center_crop=False, random_flip=False, resize=True, to_tensor=True
     ):
         # Resize preserving aspect ratio so the image covers the bucket, then crop to the bucket size.
         # The same geometry is applied to the conditioning image so the pair stays aligned.
@@ -1233,28 +1382,32 @@ class DreamBoothDataset(Dataset):
             image = TF.hflip(image)
             if dest_image is not None:
                 dest_image = TF.hflip(dest_image)
+        if not to_tensor:
+            return image, dest_image
         image = TF.normalize(TF.to_tensor(image), [0.5], [0.5])
         if dest_image is not None:
             dest_image = TF.normalize(TF.to_tensor(dest_image), [0.5], [0.5])
         return (image, dest_image) if dest_image is not None else (image, None)
 
 
+def _stack_pixels(examples, key):
+    # uint8 stays uint8 across the DataLoader hop (4x less shared memory); to_pixels() converts on device.
+    stacked = torch.stack([example[key] for example in examples]).contiguous()
+    return stacked if stacked.dtype == torch.uint8 else stacked.float()
+
+
 def collate_fn(examples):
-    pixel_values = [example["instance_images"] for example in examples]
     prompts = [example["instance_prompt"] for example in examples]
-
-    pixel_values = torch.stack(pixel_values)
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-    batch = {"pixel_values": pixel_values, "prompts": prompts, "indices": [example["index"] for example in examples]}
+    batch = {
+        "pixel_values": _stack_pixels(examples, "instance_images"),
+        "prompts": prompts,
+        "indices": [example["index"] for example in examples],
+    }
     if any("cond_images" in example for example in examples):
-        cond_pixel_values = [example["cond_images"] for example in examples]
-        cond_pixel_values = torch.stack(cond_pixel_values)
-        cond_pixel_values = cond_pixel_values.to(memory_format=torch.contiguous_format).float()
-        batch.update({"cond_pixel_values": cond_pixel_values})
+        batch["cond_pixel_values"] = _stack_pixels(examples, "cond_images")
     for key, out in (("canvas_images", "canvas_pixel_values"), ("canvas_cond_images", "canvas_cond_pixel_values")):
         if all(key in example for example in examples):
-            batch[out] = torch.stack([example[key] for example in examples]).float()
+            batch[out] = _stack_pixels(examples, key)
     return batch
 
 
@@ -1957,20 +2110,26 @@ def main(args):
         text_ids_cache = {}
         train_dataset.emit_canvas = False
 
-        def store(cache, indices, values):
-            for i, v in zip(indices, values.cpu()):
-                cache[i] = v
-
-        for batch in tqdm(train_dataloader, desc="Caching prompt embeddings"):
-            indices = batch["indices"]
-            with torch.no_grad():
-                if args.fsdp_text_encoder:
-                    prompt_embeds, text_ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
-                else:
-                    with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
-                        prompt_embeds, text_ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
-                store(prompt_embeds_cache, indices, prompt_embeds)
-                store(text_ids_cache, indices, text_ids)
+        # Prompts pad to max_sequence_length, so encode each unique caption once instead of decoding
+        # every image through the dataloader.
+        all_prompts = [p or args.instance_prompt for p in train_dataset.custom_instance_prompts[: len(train_dataset)]]
+        unique_prompts = sorted(set(all_prompts))
+        unique_cache = {}
+        with offload_models(
+            text_encoding_pipeline, device=accelerator.device, offload=args.offload and not args.fsdp_text_encoder
+        ):
+            for i in tqdm(range(0, len(unique_prompts), args.sample_batch_size), desc="Caching prompt embeddings"):
+                chunk = unique_prompts[i : i + args.sample_batch_size]
+                with torch.no_grad():
+                    prompt_embeds, text_ids = compute_text_embeddings(chunk, text_encoding_pipeline)
+                prompt_embeds, text_ids = prompt_embeds.cpu(), text_ids.cpu()
+                if text_ids.shape[0] != prompt_embeds.shape[0]:
+                    text_ids = text_ids.unsqueeze(0).expand(prompt_embeds.shape[0], *text_ids.shape)
+                for prompt, e, t in zip(chunk, prompt_embeds, text_ids):
+                    unique_cache[prompt] = (e, t)
+        for idx, prompt in enumerate(all_prompts):
+            prompt_embeds_cache[idx], text_ids_cache[idx] = unique_cache[prompt]
+        logger.info(f"Cached {len(unique_prompts)} unique prompts for {len(all_prompts)} images.")
 
         def gather(cache, indices):
             return torch.stack([cache[i] for i in indices]).to(accelerator.device)
@@ -1988,18 +2147,18 @@ def main(args):
                 val_negative_prompt_embeds = val_negative_prompt_embeds.cpu()
             for batch in tqdm(val_dataloader, desc="Caching validation set"):
                 item = {
-                    "pixel_values": batch["pixel_values"],
-                    "cond_pixel_values": batch["cond_pixel_values"],
+                    "pixel_values": to_pixels(batch["pixel_values"]),
+                    "cond_pixel_values": to_pixels(batch["cond_pixel_values"]),
                     "prompts": batch["prompts"],
                 }
                 with offload_models(vae, device=accelerator.device, offload=args.offload):
                     item["latents"] = (
-                        vae.encode(batch["pixel_values"].to(accelerator.device, dtype=vae.dtype))
+                        vae.encode(to_pixels(batch["pixel_values"], accelerator.device, vae.dtype))
                         .latent_dist.mode()
                         .cpu()
                     )
                     item["cond_latents"] = (
-                        vae.encode(batch["cond_pixel_values"].to(accelerator.device, dtype=vae.dtype))
+                        vae.encode(to_pixels(batch["cond_pixel_values"], accelerator.device, vae.dtype))
                         .latent_dist.mode()
                         .cpu()
                     )
@@ -2407,8 +2566,8 @@ def main(args):
                         cond_pixel_values = crop_window(batch["canvas_cond_pixel_values"], crop)
                     else:
                         pixel_values, cond_pixel_values = batch["pixel_values"], batch["cond_pixel_values"]
-                    pixel_values = pixel_values.to(device=accelerator.device, dtype=vae.dtype)  # target / edited
-                    cond_pixel_values = cond_pixel_values.to(device=accelerator.device, dtype=vae.dtype)  # source
+                    pixel_values = to_pixels(pixel_values, accelerator.device, vae.dtype)  # target / edited
+                    cond_pixel_values = to_pixels(cond_pixel_values, accelerator.device, vae.dtype)  # source
                     model_input = vae.encode(pixel_values).latent_dist.mode()
                     cond_model_input = vae.encode(cond_pixel_values).latent_dist.mode()
 
