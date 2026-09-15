@@ -2468,8 +2468,9 @@ def main(args):
                     if args.channel_concat_cond:
                         # stock pipeline appends cond as tokens; this model wants them channel-wise
                         cond_lat = item["cond_latents"][i : i + 1].to(device, dtype=torch.float32)
+                        # call the FSDP-wrapped module so params are unsharded; unwrapped weights are flat shards
                         decoded = denoise_channel_concat(
-                            transformer=unwrap_model(transformer),
+                            transformer=transformer,
                             vae=pipeline.vae,
                             scheduler=pipeline.scheduler,
                             cond_latents=cond_lat,
