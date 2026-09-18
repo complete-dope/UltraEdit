@@ -44,6 +44,8 @@ import os
 import time
 import random
 import shutil
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -51,6 +53,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -61,7 +64,7 @@ from peft import LoraConfig, prepare_model_for_kbit_training, set_peft_model_sta
 from peft.utils import get_peft_model_state_dict
 from PIL import Image
 from PIL.ImageOps import exif_transpose
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from torch.utils.data import Dataset
 from torch.utils.data.sampler import BatchSampler
 from torchvision import transforms
@@ -109,6 +112,11 @@ if getattr(torch, "distributed", None) is not None:
 
 if is_wandb_available():
     import wandb
+
+# Change it based on the codebase
+_FLUX_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+if _FLUX_DIR not in sys.path:
+    sys.path.insert(0, _FLUX_DIR)
 
 from channel_concat_denoise import denoise_channel_concat
 from wandb_logging import InferenceTable
@@ -840,6 +848,38 @@ def parse_args(input_args=None):
         help="Whether to offload the VAE and the text encoder to CPU when they are not used.",
     )
 
+    parser.add_argument(
+        "--latent_dir",
+        type=str,
+        default=None,
+        help="Directory with index.jsonl, encode_config.json and <split>/*.safetensors of pre-encoded, patchified, "
+        "bn-normalized latents (keys `edited`, `merged`). When set the VAE is never loaded.",
+    )
+    parser.add_argument("--latent_split", type=str, default="train", help="Split of --latent_dir used for training.")
+    parser.add_argument(
+        "--latent_val_split",
+        type=str,
+        default="test",
+        help="Split of --latent_dir used for validation; empty string disables eval.",
+    )
+    parser.add_argument("--max_train_samples", type=int, default=None, help="Use only the first N training latents.")
+    parser.add_argument("--max_val_samples", type=int, default=None, help="Use only the first N validation latents.")
+    parser.add_argument(
+        "--preload_latents", action="store_true", help="Read every training latent into RAM once instead of per step."
+    )
+    parser.add_argument(
+        "--attention_backend",
+        type=str,
+        default=None,
+        help="diffusers attention backend for the transformer, e.g. `xformers`, `flash`, `native`.",
+    )
+    parser.add_argument(
+        "--compile_transformer", action="store_true", help="torch.compile every transformer block forward."
+    )
+    parser.add_argument("--compile_mode", type=str, default="default", help="torch.compile mode for the blocks.")
+    parser.add_argument(
+        "--tracker_project_name", type=str, default="dreambooth-flux2-image2img-lora", help="wandb project name."
+    )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--enable_npu_flash_attention", action="store_true", help="Enabla Flash Attention for NPU")
     parser.add_argument("--fsdp_text_encoder", action="store_true", help="Use FSDP for text encoder")
@@ -910,7 +950,18 @@ def parse_args(input_args=None):
         assert args.image_column is not None
         assert args.caption_column is not None
 
-    if args.dataset_name is None and args.instance_data_dir is None:
+    if args.latent_dir is not None:
+        if args.instance_prompt is not None:
+            raise ValueError("--instance_prompt is unused with --latent_dir; captions come from index.jsonl.")
+        if args.dataset_name is not None or args.instance_data_dir is not None:
+            raise ValueError("--latent_dir replaces --dataset_name/--local_dataset_path/--instance_data_dir.")
+        if args.random_crop_ratio > 0:
+            raise ValueError("--random_crop_ratio is a pixel-space crop and is not supported with --latent_dir.")
+        if args.validation_prompt or args.final_validation_prompt:
+            raise ValueError("Pixel-space validation prompts need the VAE; disable them with --latent_dir.")
+        if args.latent_val_split == "":
+            args.latent_val_split = None
+    elif args.dataset_name is None and args.instance_data_dir is None:
         raise ValueError("Specify either `--dataset_name` or `--instance_data_dir`")
 
     if args.dataset_name is not None and args.instance_data_dir is not None:
@@ -1396,17 +1447,30 @@ def _stack_pixels(examples, key):
     return stacked if stacked.dtype == torch.uint8 else stacked.float()
 
 
-def collate_fn(examples):
-    prompts = [example["instance_prompt"] for example in examples]
-    batch = {
-        "pixel_values": _stack_pixels(examples, "instance_images"),
-        "prompts": prompts,
+def _base_batch(examples):
+    return {
+        "prompts": [example["instance_prompt"] for example in examples],
         "indices": [example["index"] for example in examples],
     }
-    if any("cond_images" in example for example in examples):
-        batch["cond_pixel_values"] = _stack_pixels(examples, "cond_images")
-    for key, out in (("canvas_images", "canvas_pixel_values"), ("canvas_cond_images", "canvas_cond_pixel_values")):
-        if all(key in example for example in examples):
+
+
+def latent_collate_fn(examples):
+    batch = _base_batch(examples)
+    batch["latents"] = torch.stack([example["latents"] for example in examples]).contiguous()
+    batch["cond_latents"] = torch.stack([example["cond_latents"] for example in examples]).contiguous()
+    batch["keys"] = [example["key"] for example in examples]
+    return batch
+
+
+def pixel_collate_fn(examples):
+    batch = _base_batch(examples)
+    batch["pixel_values"] = _stack_pixels(examples, "instance_images")
+    for key, out in (
+        ("cond_images", "cond_pixel_values"),
+        ("canvas_images", "canvas_pixel_values"),
+        ("canvas_cond_images", "canvas_cond_pixel_values"),
+    ):
+        if key in examples[0]:
             batch[out] = _stack_pixels(examples, key)
     return batch
 
@@ -1462,6 +1526,169 @@ class BucketBatchSampler(BatchSampler):
 
     def __len__(self):
         return self.sampler_len
+
+
+class LatentDataset(Dataset):
+    """Pre-encoded pairs from --latent_dir: `edited` (target) and `merged` (source), each already patchified to
+    (C*4, H/16, W/16) and bn-normalized, exactly what flow_matching_loss feeds the transformer."""
+
+    def __init__(self, latent_dir, split, max_samples=None, repeats=1, preload=False):
+        self.root = Path(latent_dir)
+        with open(self.root / "index.jsonl") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        rows = [r for r in rows if r["split"] == split]
+        rows.sort(key=lambda r: r["key"])
+        missing = [r["key"] for r in rows if not (self.root / r["file"]).exists()]
+        if missing:
+            logger.warning(f"{len(missing)} {split} latents listed in index.jsonl are not on disk; skipping them")
+            rows = [r for r in rows if (self.root / r["file"]).exists()]
+        if max_samples is not None:
+            rows = rows[:max_samples]
+        if not rows:
+            raise ValueError(f"No `{split}` latents found under {latent_dir}")
+        shapes = {tuple(r["edited_latent_shape"]) for r in rows} | {tuple(r["merged_latent_shape"]) for r in rows}
+        if len(shapes) != 1:
+            raise ValueError(f"All latents must share one shape for a single bucket, got {sorted(shapes)}")
+        self.rows = rows
+        self.latent_shape = shapes.pop()
+        self.num_instance_images = len(rows)
+        self._length = len(rows) * repeats
+        uncaptioned = [r["key"] for r in rows if not r.get("caption")]
+        if uncaptioned:
+            raise ValueError(
+                f"{len(uncaptioned)} `{split}` rows in index.jsonl have no `caption` "
+                f"(e.g. {uncaptioned[:3]}); re-encode the latents with captions. "
+                "--instance_prompt is not a fallback here."
+            )
+        captions = [r["caption"] for r in rows]
+        self.custom_instance_prompts = [captions[i % len(rows)] for i in range(self._length)]
+        # single bucket; BucketBatchSampler reads (payload, bucket_idx) pairs from pixel_values
+        self.buckets = [tuple(self.latent_shape[1:])]
+        self.pixel_values = [(i, 0) for i in range(self._length)]
+        self.input_size = None
+        self.emit_canvas = False
+        self._cache = None
+        if preload:
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                self._cache = list(
+                    tqdm(
+                        pool.map(self._load, range(len(rows))),
+                        total=len(rows),
+                        desc=f"Preloading {split} latents",
+                        disable=int(os.environ.get("LOCAL_RANK", 0)) != 0,
+                    )
+                )
+
+    def _load(self, idx):
+        tensors = load_file(str(self.root / self.rows[idx]["file"]))
+        return tensors["edited"], tensors["merged"]
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, index):
+        idx = index % self.num_instance_images
+        edited, merged = self._cache[idx] if self._cache is not None else self._load(idx)
+        return {
+            "index": idx,
+            "bucket_idx": 0,
+            "latents": edited,
+            "cond_latents": merged,
+            "key": self.rows[idx]["key"],
+            "instance_prompt": self.custom_instance_prompts[index],
+        }
+
+
+def latent_preview(latents, size=(512, 342)):
+    """Cheap VAE-free visual of a normalized patchified latent: unpatchify and map the first 3 channels to RGB."""
+    x = latents.detach().float().cpu()
+    if x.ndim == 3:
+        x = x.unsqueeze(0)
+    x = Flux2KleinPipeline._unpatchify_latents(x)[0, :3]
+    lo, hi = x.flatten(1).quantile(0.01, dim=1), x.flatten(1).quantile(0.99, dim=1)
+    x = ((x - lo[:, None, None]) / (hi - lo).clamp_min(1e-6)[:, None, None]).clamp(0, 1)
+    return TF.to_pil_image(x).resize(size, Image.BILINEAR)
+
+
+class LatentEvalTable:
+    COLUMNS = [
+        "step",
+        "epoch",
+        "sample",
+        "key",
+        "prompt",
+        "seed",
+        "guidance_scale",
+        "num_inference_steps",
+        "source",
+        "target",
+        "prediction",
+        "latent_mse",
+        "latent_psnr",
+        "latent_cosine",
+        "val_loss",
+    ]
+    _tables = {}
+
+    def __init__(self, accelerator):
+        self.tracker = next((t for t in accelerator.trackers if t.name == "wandb"), None)
+        self.rows, self.strips = [], []
+
+    @property
+    def enabled(self):
+        return self.tracker is not None and is_wandb_available()
+
+    def add(self, *, source, target, prediction, sample, latent_psnr, latent_mse, **cols):
+        if not self.enabled:
+            return
+        pils = [latent_preview(source), latent_preview(target), latent_preview(prediction)]
+        strip = Image.new("RGB", (sum(p.width for p in pils), pils[0].height), "white")
+        for i, p in enumerate(pils):
+            strip.paste(p, (i * p.width, 0))
+        self.strips.append(wandb.Image(strip, caption=f"s{sample} mse={latent_mse:.4f} psnr={latent_psnr:.2f}"))
+        row = dict(cols, sample=sample, latent_mse=latent_mse, latent_psnr=latent_psnr)
+        row.update(source=wandb.Image(pils[0]), target=wandb.Image(pils[1]), prediction=wandb.Image(pils[2]))
+        self.rows.append([row.get(c) for c in self.COLUMNS])
+
+    def log(self, key, step):
+        if not self.enabled or not self.rows:
+            return
+        table = self._tables.get(key)
+        if table is None:
+            table = wandb.Table(columns=self.COLUMNS, log_mode="INCREMENTAL")
+            self._tables[key] = table
+        for row in self.rows:
+            table.add_data(*row)
+        self.tracker.log({key: table, f"{key}_compare": self.strips}, step=step)
+        self.rows, self.strips = [], []
+
+
+def _block_forward(block, *args, **kwargs):
+    return type(block).forward(block, *args, **kwargs)
+
+
+def _block_forward_ckpt(block, *args, **kwargs):
+    if not torch.is_grad_enabled():
+        return type(block).forward(block, *args, **kwargs)
+    return torch.utils.checkpoint.checkpoint(type(block).forward, block, *args, use_reentrant=False, **kwargs)
+
+
+def compile_transformer_blocks(model, mode="default", checkpoint=False):
+    # One compiled function shared by every block: dynamo guards on module structure, not identity, so
+    # same-class blocks reuse a graph instead of recompiling 25 times. Activation checkpointing sits
+    # INSIDE the compiled region (torchtitan order); checkpoint wrapped around a compiled forward breaks
+    # recompute metadata checks. FSDP hooks stay outside, and block class names stay intact for FSDP's
+    # transformer_layer_cls_to_wrap policy.
+    import functools
+
+    torch._dynamo.config.recompile_limit = max(getattr(torch._dynamo.config, "recompile_limit", 8), 64)
+    compiled = torch.compile(_block_forward_ckpt if checkpoint else _block_forward, mode=mode, dynamic=False)
+    n = 0
+    for name in ("transformer_blocks", "single_transformer_blocks"):
+        for block in getattr(model, name, []):
+            block.forward = functools.partial(compiled, block)
+            n += 1
+    logger.info(f"torch.compile applied to {n} transformer blocks (mode={mode}, checkpoint_inside={checkpoint})")
 
 
 class PromptDataset(Dataset):
@@ -1545,18 +1772,32 @@ def main(args):
                 exist_ok=True,
             ).repo_id
 
-    def push_checkpoint_to_hub(save_path):
-        api = HfApi()
+    def remote_checkpoints(api):
         try:
-            remote = [
+            names = [
                 Path(entry.path).name
                 for entry in api.list_repo_tree(repo_id, path_in_repo="checkpoints")
                 if Path(entry.path).name.startswith("checkpoint-")
             ]
         except EntryNotFoundError:
-            remote = []
-        remote = sorted(remote, key=lambda x: int(x.split("-")[1]))
-        while len(remote) >= args.hub_checkpoints_limit:
+            names = []
+        return sorted(names, key=lambda x: int(x.split("-")[1]))
+
+    def strip_bin_states(api, name):
+        """Only the newest Hub checkpoint keeps the .bin resume state; older ones keep safetensors."""
+        stale = [
+            entry.path
+            for entry in api.list_repo_tree(repo_id, path_in_repo=f"checkpoints/{name}")
+            if entry.path.endswith(".bin")
+        ]
+        if stale:
+            logger.info(f"Dropping resume state from {repo_id}/checkpoints/{name}: {len(stale)} .bin files")
+            api.delete_files(repo_id=repo_id, delete_patterns=stale, commit_message=f"Strip .bin state from {name}")
+
+    def push_checkpoint_to_hub(save_path):
+        api = HfApi()
+        remote = remote_checkpoints(api)
+        while args.hub_checkpoints_limit > 0 and len(remote) >= args.hub_checkpoints_limit:
             oldest = remote.pop(0)
             logger.info(f"Hub checkpoint limit reached, deleting {oldest} from {repo_id}")
             api.delete_folder(path_in_repo=f"checkpoints/{oldest}", repo_id=repo_id)
@@ -1568,6 +1809,9 @@ def main(args):
             path_in_repo=f"checkpoints/{name}",
             commit_message=f"Training checkpoint {name}",
         )
+        for older in remote:
+            if older != name:
+                strip_bin_states(api, older)
 
     # Load the tokenizers
     tokenizer = Qwen2TokenizerFast.from_pretrained(
@@ -1596,16 +1840,32 @@ def main(args):
         revision=args.revision,
     )
     noise_scheduler_copy = copy.deepcopy(noise_scheduler)
-    vae = AutoencoderKLFlux2.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="vae",
-        revision=args.revision,
-        variant=args.variant,
-    )
-    latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(accelerator.device)
-    latents_bn_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps).to(
-        accelerator.device
-    )
+    use_latents = args.latent_dir is not None
+    if use_latents:
+        # Latents were encoded offline; the bn statistics come from the encoder's config, not the VAE weights.
+        vae = None
+        with open(os.path.join(args.latent_dir, "encode_config.json")) as f:
+            encode_config = json.load(f)
+        latents_bn_mean = torch.tensor(encode_config["bn_running_mean"]).view(1, -1, 1, 1).to(accelerator.device)
+        latents_bn_std = torch.sqrt(
+            torch.tensor(encode_config["bn_running_var"]).view(1, -1, 1, 1) + encode_config["batch_norm_eps"]
+        ).to(accelerator.device)
+        logger.info(
+            f"Using pre-encoded latents from {args.latent_dir} (vae={encode_config.get('vae')}, "
+            f"size={encode_config.get('size')}, normalization={encode_config.get('normalization')}); VAE not loaded."
+        )
+    else:
+        print("---x--- FOUND NO LATENTS FOR THE IMAGES SO LOADING IN VAE MODEL AND ENCODING IT USING THAT VAE MODEL HERE")
+        vae = AutoencoderKLFlux2.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="vae",
+            revision=args.revision,
+            variant=args.variant,
+        )
+        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(accelerator.device)
+        latents_bn_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps).to(
+            accelerator.device
+        )
 
     quantization_config = None
     if args.bnb_quantization_config_path is not None:
@@ -1656,7 +1916,8 @@ def main(args):
 
     # LoRA: only the adapter layers are trained. Full: every transformer weight is trained.
     transformer.requires_grad_(is_full_finetune)
-    vae.requires_grad_(False)
+    if vae is not None:
+        vae.requires_grad_(False)  # Always FALSE, training / finetuning a VAE is out of scope here
 
     if args.enable_npu_flash_attention:
         if is_torch_npu_available():
@@ -1673,7 +1934,8 @@ def main(args):
 
     to_kwargs = {"dtype": weight_dtype, "device": accelerator.device} if not args.offload else {"dtype": weight_dtype}
     # flux vae is stable in bf16 so load it in weight_dtype to reduce memory
-    vae.to(**to_kwargs)
+    if vae is not None:
+        vae.to(**to_kwargs)
     # we never offload the transformer to CPU, so we can just use the accelerator device
     transformer_to_kwargs = (
         {"device": accelerator.device}
@@ -1729,6 +1991,14 @@ def main(args):
             modules_to_save=["x_embedder"] if args.channel_concat_cond else None,
         )
         transformer.add_adapter(transformer_lora_config)
+
+    if args.attention_backend is not None:
+        transformer.set_attention_backend(args.attention_backend)
+        logger.info(f"transformer attention backend: {args.attention_backend}")
+    if args.compile_transformer:
+        if args.gradient_checkpointing:
+            transformer.disable_gradient_checkpointing()
+        compile_transformer_blocks(transformer, args.compile_mode, checkpoint=args.gradient_checkpointing)
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -1986,25 +2256,46 @@ def main(args):
             val_crop_size = (args.validation_height, args.validation_width)
 
     # Dataset and DataLoaders creation:
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        size=args.resolution,
-        repeats=args.repeats,
-        center_crop=args.center_crop,
-        buckets=buckets,
-        use_aspect_ratio_buckets=use_aspect_ratio_buckets,
-        split="train",
-        val_split_ratio=args.val_split_ratio,
-        split_seed=args.val_split_seed,
-        original_size=original_size,
-        crop_size=train_crop_size,
-        input_size=(args.input_height, args.input_width) if args.random_crop_ratio > 0 else None,
-    )
+    val_dataset = None
+    if use_latents:
+        train_dataset = LatentDataset(
+            args.latent_dir,
+            args.latent_split,
+            max_samples=args.max_train_samples,
+            repeats=args.repeats,
+            preload=args.preload_latents,
+        )
+        logger.info(
+            f"Training on {train_dataset.num_instance_images} `{args.latent_split}` latents of shape "
+            f"{train_dataset.latent_shape} ({train_dataset.latent_shape[1] * train_dataset.latent_shape[2]} tokens)."
+        )
+        if args.latent_val_split:
+            val_dataset = LatentDataset(
+                args.latent_dir,
+                args.latent_val_split,
+                max_samples=args.max_val_samples,
+                preload=True,
+            )
+            logger.info(f"Validation on {len(val_dataset)} `{args.latent_val_split}` latents.")
+    else:
+        train_dataset = DreamBoothDataset(
+            instance_data_root=args.instance_data_dir,
+            instance_prompt=args.instance_prompt,
+            size=args.resolution,
+            repeats=args.repeats,
+            center_crop=args.center_crop,
+            buckets=buckets,
+            use_aspect_ratio_buckets=use_aspect_ratio_buckets,
+            split="train",
+            val_split_ratio=args.val_split_ratio,
+            split_seed=args.val_split_seed,
+            original_size=original_size,
+            crop_size=train_crop_size,
+            input_size=(args.input_height, args.input_width) if args.random_crop_ratio > 0 else None,
+        )
     if train_dataset.input_size is not None and len(train_dataset.buckets) != 1:
         raise ValueError("--random_crop_ratio needs a single fixed resolution bucket.")
-    val_dataset = None
-    if args.val_split_ratio > 0:
+    if args.val_split_ratio > 0 and not use_latents:
         val_dataset = DreamBoothDataset(
             instance_data_root=args.instance_data_dir,
             instance_prompt=args.instance_prompt,
@@ -2024,6 +2315,7 @@ def main(args):
     # Caches are keyed by dataset index (carried in batch["indices"]), so they survive dataloader
     # sharding across ranks and per-epoch reshuffling.
     precompute_prompts = bool(train_dataset.custom_instance_prompts)
+    collate = latent_collate_fn if use_latents else pixel_collate_fn
     batch_sampler = BucketBatchSampler(
         train_dataset,
         batch_size=args.train_batch_size,
@@ -2033,7 +2325,7 @@ def main(args):
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_sampler=batch_sampler,
-        collate_fn=lambda examples: collate_fn(examples),
+        collate_fn=collate,
         num_workers=args.dataloader_num_workers,
     )
 
@@ -2044,7 +2336,7 @@ def main(args):
             batch_sampler=BucketBatchSampler(
                 val_dataset, batch_size=args.train_batch_size, drop_last=False, shuffle_batches_each_epoch=False
             ),
-            collate_fn=lambda examples: collate_fn(examples),
+            collate_fn=collate,
             num_workers=args.dataloader_num_workers,
         )
 
@@ -2146,22 +2438,30 @@ def main(args):
                 val_negative_prompt_embeds, _ = compute_text_embeddings("", text_encoding_pipeline)
                 val_negative_prompt_embeds = val_negative_prompt_embeds.cpu()
             for batch in tqdm(val_dataloader, desc="Caching validation set"):
-                item = {
-                    "pixel_values": to_pixels(batch["pixel_values"]),
-                    "cond_pixel_values": to_pixels(batch["cond_pixel_values"]),
-                    "prompts": batch["prompts"],
-                }
-                with offload_models(vae, device=accelerator.device, offload=args.offload):
-                    item["latents"] = (
-                        vae.encode(to_pixels(batch["pixel_values"], accelerator.device, vae.dtype))
-                        .latent_dist.mode()
-                        .cpu()
-                    )
-                    item["cond_latents"] = (
-                        vae.encode(to_pixels(batch["cond_pixel_values"], accelerator.device, vae.dtype))
-                        .latent_dist.mode()
-                        .cpu()
-                    )
+                if use_latents:
+                    item = {
+                        "latents": batch["latents"],
+                        "cond_latents": batch["cond_latents"],
+                        "prompts": batch["prompts"],
+                        "keys": batch["keys"],
+                    }
+                else:
+                    item = {
+                        "pixel_values": to_pixels(batch["pixel_values"]),
+                        "cond_pixel_values": to_pixels(batch["cond_pixel_values"]),
+                        "prompts": batch["prompts"],
+                    }
+                    with offload_models(vae, device=accelerator.device, offload=args.offload):
+                        item["latents"] = (
+                            vae.encode(to_pixels(batch["pixel_values"], accelerator.device, vae.dtype))
+                            .latent_dist.mode()
+                            .cpu()
+                        )
+                        item["cond_latents"] = (
+                            vae.encode(to_pixels(batch["cond_pixel_values"], accelerator.device, vae.dtype))
+                            .latent_dist.mode()
+                            .cpu()
+                        )
                 if train_dataset.custom_instance_prompts:
                     with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
                         embeds, ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
@@ -2221,8 +2521,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        tracker_name = "dreambooth-flux2-image2img-lora"
-        accelerator.init_trackers(tracker_name, config=vars(args))
+        accelerator.init_trackers(args.tracker_project_name, config=vars(args))
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -2313,11 +2612,12 @@ def main(args):
     def flow_matching_loss(
         model_input, cond_model_input, prompt_embeds, text_ids, generator=None, conditioning_dropout_prob=None
     ):
-        model_input = Flux2KleinPipeline._patchify_latents(model_input)
-        model_input = (model_input - latents_bn_mean) / latents_bn_std
+        if not use_latents:
+            model_input = Flux2KleinPipeline._patchify_latents(model_input)
+            model_input = (model_input - latents_bn_mean) / latents_bn_std
 
-        cond_model_input = Flux2KleinPipeline._patchify_latents(cond_model_input)
-        cond_model_input = (cond_model_input - latents_bn_mean) / latents_bn_std
+            cond_model_input = Flux2KleinPipeline._patchify_latents(cond_model_input)
+            cond_model_input = (cond_model_input - latents_bn_mean) / latents_bn_std
 
         if conditioning_dropout_prob is not None:
             # InstructPix2Pix schedule on one draw: text dropped for p < 2q, image dropped for q <= p < 3q.
@@ -2418,7 +2718,147 @@ def main(args):
         loss = loss.mean()
         return loss
 
+    @torch.no_grad()
+    def denoise_latents(cond, prompt_embeds, text_ids, num_inference_steps, guidance_scale, generator):
+        # Same input prep as flow_matching_loss, returns the normalized patchified latent prediction.
+        from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu
+
+        device, dtype = accelerator.device, weight_dtype
+        cond = cond.to(device=device, dtype=dtype)
+        packed_cond = Flux2KleinPipeline._pack_latents(cond)
+        latents = torch.randn(cond.shape, generator=generator, device="cpu").to(device=device, dtype=dtype) # So here we concatenate channels here ( we are adding in channels from noise and adding in channels from the original image so that we can get the nice image out)
+        packed = Flux2KleinPipeline._pack_latents(latents)
+        img_ids = Flux2KleinPipeline._prepare_latent_ids(cond).to(device=device)
+        cond_ids = Flux2KleinPipeline._prepare_image_ids([cond[0:1]]).to(device=device).expand(cond.shape[0], -1, -1)
+
+        scheduler = copy.deepcopy(noise_scheduler)
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        if getattr(scheduler.config, "use_flow_sigmas", False):
+            sigmas = None
+        mu = compute_empirical_mu(image_seq_len=packed.shape[1], num_steps=num_inference_steps)
+        scheduler.set_timesteps(sigmas=sigmas, device=device, mu=mu)
+        guidance = None
+        if unwrap_model(transformer).config.guidance_embeds and guidance_scale is not None:
+            guidance = torch.full([packed.shape[0]], guidance_scale, device=device)
+
+        for t in scheduler.timesteps:
+            if args.channel_concat_cond:
+                model_in, ids = torch.cat([packed, packed_cond], dim=-1), img_ids
+            else:
+                model_in, ids = torch.cat([packed, packed_cond], dim=1), torch.cat([img_ids, cond_ids], dim=1)
+            pred = transformer(
+                hidden_states=model_in,
+                timestep=t.expand(packed.shape[0]).to(dtype) / 1000,
+                guidance=guidance,
+                encoder_hidden_states=prompt_embeds.to(device=device, dtype=dtype),
+                txt_ids=text_ids.to(device=device),
+                img_ids=ids,
+                return_dict=False,
+            )[0][:, : packed.shape[1], :]
+            packed = scheduler.step(pred.float(), t, packed.float(), return_dict=False)[0].to(dtype)
+        return Flux2KleinPipeline._unpack_latents_with_ids(packed, img_ids)
+
+    def run_latent_eval(step, epoch):
+        transformer.eval()
+        device = accelerator.device
+        table = LatentEvalTable(accelerator)
+        generator = torch.Generator(device="cpu").manual_seed(args.seed if args.seed is not None else 0)
+        autocast_ctx = torch.autocast(device.type) if device.type != "mps" else nullcontext()
+
+        val_losses, per_sample_loss = [], {}
+        with torch.no_grad(), autocast_ctx:
+            for item in val_cache:
+                for i in range(item["latents"].shape[0]):
+                    loss = flow_matching_loss(
+                        item["latents"][i : i + 1].to(device, dtype=weight_dtype),
+                        item["cond_latents"][i : i + 1].to(device, dtype=weight_dtype),
+                        item["prompt_embeds"][i : i + 1].to(device),
+                        item["text_ids"][i : i + 1].to(device) if item["text_ids"].ndim == 3 else item["text_ids"].to(device),
+                        generator=generator,
+                    ).item()
+                    val_losses.append(loss)
+                    per_sample_loss[item["keys"][i]] = loss
+        logs = {"val_loss": sum(val_losses) / len(val_losses)}
+
+        mse_sum, psnr_sum, cos_sum, n_done = 0.0, 0.0, 0.0, 0
+        # normalized latents dumped for the offline decode script (flux/4k/decode_eval_results.py)
+        dump = {} if accelerator.is_main_process else None
+        with torch.no_grad(), autocast_ctx:
+            for item in val_cache:
+                for i in range(item["latents"].shape[0]):
+                    if n_done >= args.num_eval_samples:
+                        break
+                    target = item["latents"][i : i + 1].to(device, dtype=torch.float32)
+                    pred = denoise_latents(
+                        item["cond_latents"][i : i + 1],
+                        item["prompt_embeds"][i : i + 1],
+                        item["text_ids"][i : i + 1] if item["text_ids"].ndim == 3 else item["text_ids"],
+                        num_inference_steps=args.eval_inference_steps,
+                        guidance_scale=args.eval_guidance_scale,
+                        generator=torch.Generator(device="cpu").manual_seed(n_done),
+                    ).float()
+                    mse = F.mse_loss(pred, target).item()
+                    # latents are unit-variance normalized, so psnr uses the observed target range
+                    peak = (target.max() - target.min()).item()
+                    psnr = 10 * math.log10(peak**2 / max(mse, 1e-12))
+                    cos = F.cosine_similarity(pred.flatten(), target.flatten(), dim=0).item()
+                    mse_sum, psnr_sum, cos_sum = mse_sum + mse, psnr_sum + psnr, cos_sum + cos
+                    table.add(
+                        step=step,
+                        epoch=epoch,
+                        sample=n_done,
+                        key=item["keys"][i],
+                        prompt=item["prompts"][i],
+                        seed=n_done,
+                        guidance_scale=args.eval_guidance_scale,
+                        num_inference_steps=args.eval_inference_steps,
+                        source=item["cond_latents"][i],
+                        target=item["latents"][i],
+                        prediction=pred[0],
+                        latent_mse=mse,
+                        latent_psnr=psnr,
+                        latent_cosine=cos,
+                        val_loss=per_sample_loss[item["keys"][i]],
+                    )
+                    if dump is not None:
+                        k = item["keys"][i]
+                        dump[f"{k}/source"] = item["cond_latents"][i].to(torch.bfloat16).cpu().contiguous()
+                        dump[f"{k}/target"] = item["latents"][i].to(torch.bfloat16).cpu().contiguous()
+                        dump[f"{k}/prediction"] = pred[0].to(torch.bfloat16).cpu().contiguous()
+                        dump[f"{k}/latent_mse"] = torch.tensor([mse])
+                        dump[f"{k}/val_loss"] = torch.tensor([per_sample_loss[k]])
+                    n_done += 1
+        if dump:
+            dump_dir = os.path.join(args.output_dir, "eval_latents")
+            os.makedirs(dump_dir, exist_ok=True)
+            prompts = {item["keys"][i]: item["prompts"][i] for item in val_cache for i in range(len(item["keys"]))}
+            meta = {"step": str(step), "epoch": str(epoch), "prompts": json.dumps(prompts), "split": str(args.latent_val_split)}
+            tmp = os.path.join(dump_dir, f"step-{step:06d}.safetensors.tmp")
+            save_file(dump, tmp, metadata=meta)
+            os.replace(tmp, tmp[: -len(".tmp")])
+        if n_done:
+            logs.update(
+                {"val_latent_mse": mse_sum / n_done, "val_latent_psnr": psnr_sum / n_done, "val_latent_cosine": cos_sum / n_done}
+            )
+
+        try:
+            xw = unwrap_model(transformer).x_embedder.weight
+            xw = xw.to_local() if hasattr(xw, "to_local") else xw
+            half = xw.shape[1] // 2
+            img_mag = xw[:, :half].abs().mean()
+            logs["cond_img_ratio"] = (xw[:, half:].abs().mean() / img_mag.clamp_min(1e-12)).item()
+        except Exception as e:
+            logger.warning(f"cond_img_ratio unavailable: {e}")
+
+        logger.info(f"step {step} latent eval: " + ", ".join(f"{k}={v:.4f}" for k, v in logs.items()))
+        accelerator.log(logs, step=step)
+        table.log("eval_table/latent_samples", step=step)
+        free_memory()
+        transformer.train()
+
     def run_eval(step, epoch):
+        if use_latents:
+            return run_latent_eval(step, epoch)
         from torchmetrics.image import PeakSignalNoiseRatio
         from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
@@ -2543,6 +2983,9 @@ def main(args):
         transformer.train()
 
     epoch = first_epoch  # for the post-loop run_eval when no epoch runs
+    step_t0 = time.perf_counter()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()  # weights are unfreezed here now
 
@@ -2550,7 +2993,7 @@ def main(args):
             models_to_accumulate = [transformer]
             prompts = batch["prompts"]
 
-            with accelerator.accumulate(models_to_accumulate):
+            with accelerator.accumulate(*models_to_accumulate):
                 if train_dataset.custom_instance_prompts:
                     prompt_embeds = gather(prompt_embeds_cache, batch["indices"])
                     text_ids = gather(text_ids_cache, batch["indices"])
@@ -2559,18 +3002,24 @@ def main(args):
                     prompt_embeds = prompt_embeds.repeat(num_repeat_elements, 1, 1)
                     text_ids = text_ids.repeat(num_repeat_elements, 1, 1)
 
-                # Pick random crop or full image, then VAE-encode the pixels live for this step
-                crop = sample_crop_params()
-                with offload_models(vae, device=accelerator.device, offload=args.offload):
-                    if crop is not None:
-                        pixel_values = crop_window(batch["canvas_pixel_values"], crop)
-                        cond_pixel_values = crop_window(batch["canvas_cond_pixel_values"], crop)
-                    else:
-                        pixel_values, cond_pixel_values = batch["pixel_values"], batch["cond_pixel_values"]
-                    pixel_values = to_pixels(pixel_values, accelerator.device, vae.dtype)  # target / edited
-                    cond_pixel_values = to_pixels(cond_pixel_values, accelerator.device, vae.dtype)  # source
-                    model_input = vae.encode(pixel_values).latent_dist.mode()
-                    cond_model_input = vae.encode(cond_pixel_values).latent_dist.mode()
+                crop = None
+                if use_latents:
+                    # Pre-encoded, patchified, bn-normalized latents go straight to the transformer
+                    model_input = batch["latents"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
+                    cond_model_input = batch["cond_latents"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
+                else:
+                    # Pick random crop or full image, then VAE-encode the pixels live for this step
+                    crop = sample_crop_params()
+                    with offload_models(vae, device=accelerator.device, offload=args.offload):
+                        if crop is not None:
+                            pixel_values = crop_window(batch["canvas_pixel_values"], crop)
+                            cond_pixel_values = crop_window(batch["canvas_cond_pixel_values"], crop)
+                        else:
+                            pixel_values, cond_pixel_values = batch["pixel_values"], batch["cond_pixel_values"]
+                        pixel_values = to_pixels(pixel_values, accelerator.device, vae.dtype)  # target / edited
+                        cond_pixel_values = to_pixels(cond_pixel_values, accelerator.device, vae.dtype)  # source
+                        model_input = vae.encode(pixel_values).latent_dist.mode()
+                        cond_model_input = vae.encode(cond_pixel_values).latent_dist.mode()
 
                 loss = flow_matching_loss(
                     model_input,
@@ -2637,7 +3086,25 @@ def main(args):
                         logger.error(f"eval at step {global_step} failed, training continues: {e}", exc_info=True)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "random_crop": float(crop is not None)}
-            progress_bar.set_postfix(**logs)
+            if accelerator.sync_gradients: # sync-gradients 
+                now = time.perf_counter()
+                step_time = now - step_t0
+                step_t0 = now
+                samples = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+                tokens = model_input.shape[-2] * model_input.shape[-1] * samples
+                logs.update(
+                    {
+                        "perf/step_time_s": step_time,
+                        "perf/samples_per_s": samples / step_time,
+                        "perf/img_tokens_per_s": tokens / step_time,
+                        "perf/epoch": epoch,
+                    }
+                )
+                if torch.cuda.is_available():
+                    logs["perf/gpu_mem_alloc_gb"] = torch.cuda.memory_allocated() / 1024**3
+                    logs["perf/gpu_mem_peak_gb"] = torch.cuda.max_memory_allocated() / 1024**3
+                    logs["perf/gpu_mem_reserved_gb"] = torch.cuda.memory_reserved() / 1024**3
+            progress_bar.set_postfix(loss=logs["loss"], lr=logs["lr"], **({"s/it": round(logs["perf/step_time_s"], 2)} if "perf/step_time_s" in logs else {}))
             accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
@@ -2767,7 +3234,7 @@ def main(args):
             (args.hub_model_id or Path(args.output_dir).name) if not args.push_to_hub else repo_id,
             images=images,
             base_model=args.pretrained_model_name_or_path,
-            instance_prompt=args.instance_prompt,
+            instance_prompt=args.instance_prompt or train_dataset.custom_instance_prompts[0],
             validation_prompt=validation_prompt,
             repo_folder=args.output_dir,
             fp8_training=args.do_fp8_training,
