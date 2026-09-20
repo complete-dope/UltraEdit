@@ -488,6 +488,12 @@ def parse_args(input_args=None):
     parser.add_argument("--eval_inference_steps", type=int, default=28, help="Sampling steps for image metrics.")
     parser.add_argument("--eval_guidance_scale", type=float, default=4.0, help="Guidance scale for image metrics.")
     parser.add_argument(
+        "--eval_image_guidance_scale",
+        type=float,
+        default=1.5,
+        help="InstructPix2Pix image guidance for --channel_concat_cond eval (1.0 disables the image-null branch).",
+    )
+    parser.add_argument(
         "--training_mode",
         type=str,
         default="full",
@@ -2920,6 +2926,8 @@ def main(args):
                             latents_bn_std=latents_bn_std,
                             num_inference_steps=args.eval_inference_steps,
                             guidance_scale=args.eval_guidance_scale,
+                            image_guidance_scale=args.eval_image_guidance_scale,
+                            negative_prompt_embeds=val_negative_prompt_embeds,
                             generator=torch.Generator(device="cpu").manual_seed(n_done),
                             device=device,
                             dtype=weight_dtype,

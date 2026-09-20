@@ -21,6 +21,7 @@ P.add_argument("--height", type=int, default=1360)
 P.add_argument("--width", type=int, default=2048)
 P.add_argument("--steps", type=int, default=28)
 P.add_argument("--guidance_scale", type=float, default=4.0)
+P.add_argument("--image_guidance_scale", type=float, default=1.5)
 P.add_argument("--out", default="/workspace/runs/ckpt_validation")
 P.add_argument("--wandb_project", default="dreambooth-flux2-image2img-lora")
 a = P.parse_args()
@@ -45,6 +46,8 @@ def prep(img, H, W):
 
 
 pipe = Flux2KleinPipeline.from_pretrained(a.base, transformer=None, vae=None, torch_dtype=dt).to(dev)
+neg_pe, _ = pipe.encode_prompt(prompt=[""], device=dev, num_images_per_prompt=1)
+neg_pe = neg_pe.cpu()
 samples = []
 for r in val:
     pe, tids = pipe.encode_prompt(prompt=[r["caption"]], device=dev, num_images_per_prompt=1)
@@ -92,7 +95,8 @@ for cdir in ckpts:
         dec = denoise_channel_concat(
             transformer=tr, vae=vae, scheduler=sched, cond_latents=s["cond_lat"].to(dev, torch.float32),
             prompt_embeds=s["pe"], text_ids=s["tids"], latents_bn_mean=bn_mean, latents_bn_std=bn_std,
-            num_inference_steps=a.steps, guidance_scale=a.guidance_scale,
+            num_inference_steps=a.steps, guidance_scale=a.guidance_scale, image_guidance_scale=a.image_guidance_scale,
+            negative_prompt_embeds=neg_pe,
             generator=torch.Generator("cpu").manual_seed(i), device=dev, dtype=dt,
         )
         pred = (dec * 0.5 + 0.5).clamp(0, 1).float()
