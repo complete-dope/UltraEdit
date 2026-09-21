@@ -235,7 +235,12 @@ while True:
     for cdir in ckpts:
         if not os.path.exists(cdir):
             continue  # rotated away by checkpoints_total_limit before we got to it
-        evaluate(cdir)
+        try:
+            evaluate(cdir)
+        except Exception as e:
+            # checkpoint rotated away mid-eval or half-written; skip it, keep watching
+            print(f"  !! checkpoint-{ckpt_step(cdir)} failed: {type(e).__name__}: {e}", flush=True)
+            free_cuda()
     if not a.watch:
         break
     time.sleep(a.poll_seconds)

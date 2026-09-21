@@ -9,8 +9,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 MODEL="/workspace/models/FLUX.2-klein-base-4B" # base model 
 DATASET_PATH="/workspace/datasets/exteriors-v5"
-OUTPUT_DIR="/workspace/runs/klein-base-4b-exteriors-v5-full"
-RUN_NAME="klein-base-4b-exteriors-v5-full"
+OUTPUT_DIR="/workspace/runs/klein-base-4b-exteriors-v5-regionloss"
+RUN_NAME="klein-base-4b-exteriors-v5-regionloss"
 HUB_ID="fotello-ai/flux-klein-4b-exterior-v1"
 
 # HF_TOKEN lives in ~/.bashrc, which non-interactive shells skip; read it directly.
@@ -43,6 +43,8 @@ ARGS=(
   --max_sequence_length 512 # token cap for the text prompt
   --channel_concat_cond # decides to concat based on channel on concat it in the tokens
   --conditioning_dropout_prob 0.05
+  --changed_region_loss # upweight loss where target != cond so copying the source is penalised
+  --changed_region_weight 3.0
   --input_width 4096
   --input_height 2728
   --resolution_width 2048
@@ -65,7 +67,7 @@ ARGS=(
   --gradient_accumulation_steps 3 # 8 x 3 x 3 GPUs = 72
   --max_train_steps 20000 
   --learning_rate 1e-5 # full finetune of transformer 4B params
-  --x_embedder_lr 1e-3 # cond half is zero-init; at 1e-5 it never becomes usable
+  --x_embedder_lr 1e-4 # cond half is zero-init; at 1e-5 it never becomes usable
   --lr_scheduler cosine
   --lr_warmup_steps 400
   --lr_num_cycles 1
@@ -76,8 +78,8 @@ ARGS=(
   --adam_epsilon 1e-8
   --max_grad_norm 1.0
   --guidance_scale 3.5
-  --weighting_scheme none
-  --logit_mean 0.0
+  --weighting_scheme logit_normal # bias sigma draws toward mid/late denoising where the edit is drawn
+  --logit_mean -0.5
   --logit_std 1.0
   --mode_scale 1.29
   --mixed_precision bf16
@@ -90,9 +92,6 @@ ARGS=(
   --resume_from_checkpoint latest
   --report_to wandb 
   --logging_dir logs
-  --push_to_hub                            # final transformer/ + model card -> $HUB_ID
-  --push_checkpoints_to_hub                # each checkpoint-N -> $HUB_ID/checkpoints/checkpoint-N (~58GB each)
-  --hub_checkpoints_limit 3                # matches --checkpoints_total_limit; oldest on hub is deleted first
   --hub_model_id "$HUB_ID"
 )
 

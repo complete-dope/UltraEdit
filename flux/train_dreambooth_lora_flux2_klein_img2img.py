@@ -586,6 +586,19 @@ def parse_args(input_args=None):
         "grows too slowly to ever use the cond image. The pretrained img half stays at --learning_rate.",
     )
     parser.add_argument(
+        "--changed_region_loss",
+        action="store_true",
+        help="Upweight the flow loss on latent tokens where the target differs from the cond image, so copying "
+        "the source is penalised where an edit is expected.",
+    )
+    parser.add_argument(
+        "--changed_region_weight",
+        type=float,
+        default=3.0,
+        help="Strength of --changed_region_loss: token weight = 1 + w * (diff / mean diff), clamped to --changed_region_max.",
+    )
+    parser.add_argument("--changed_region_max", type=float, default=10.0, help="Clamp for the per-token region weight.")
+    parser.add_argument(
         "--transformer_dtype",
         type=str,
         default='fp32',
@@ -2408,6 +2421,15 @@ def main(args):
         cond_model_input = Flux2KleinPipeline._patchify_latents(cond_model_input)
         cond_model_input = (cond_model_input - latents_bn_mean) / latents_bn_std
 
+        # computed before cond dropout so a zeroed cond does not mark the whole image as changed
+        region_w = None
+        if args.changed_region_loss:
+            with torch.no_grad():
+                diff = (model_input.float() - cond_model_input.float()).norm(dim=1, keepdim=True)
+                diff = diff / diff.mean(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+                region_w = (1.0 + args.changed_region_weight * diff).clamp(max=args.changed_region_max)
+                region_w = region_w / region_w.mean(dim=(2, 3), keepdim=True)
+
         if conditioning_dropout_prob is not None:
             # InstructPix2Pix schedule on one draw: text dropped for p < 2q, image dropped for q <= p < 3q.
             # Image null = zeros in normalized latent space; the inference pipeline must use the same null.
@@ -2500,10 +2522,10 @@ def main(args):
         target = noise - model_input
 
         # Compute regular loss.
-        loss = torch.mean(
-            (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
-            1,
-        )
+        sq_err = weighting.float() * (model_pred.float() - target.float()) ** 2
+        if region_w is not None:
+            sq_err = sq_err * region_w
+        loss = torch.mean(sq_err.reshape(target.shape[0], -1), 1)
         loss = loss.mean()
         return loss
 
