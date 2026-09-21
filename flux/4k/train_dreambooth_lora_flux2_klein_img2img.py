@@ -377,6 +377,24 @@ def parse_args(input_args=None):
     parser.add_argument("--repeats", type=int, default=1, help="How many times to repeat the training data.")
 
     parser.add_argument(
+        "--use_weighted_sampler",
+        action="store_true",
+        help="Oversample rows whose --weighted_sampler_column is truthy, as in the sd3-pix2pix trainer.",
+    )
+    parser.add_argument(
+        "--weighted_sampler_weight",
+        type=float,
+        default=0.5,
+        help="Draw weight for truthy rows; falsy rows get 1 - this. 0.5 is a no-op.",
+    )
+    parser.add_argument(
+        "--weighted_sampler_column",
+        type=str,
+        default="self_edit",
+        help="Boolean dataset column the sampler weights on.",
+    )
+
+    parser.add_argument(
         "--class_data_dir",
         type=str,
         default=None,
@@ -1084,6 +1102,7 @@ class DreamBoothDataset(Dataset):
 
         self.instance_prompt = instance_prompt
         self.custom_instance_prompts = None
+        self.sample_weights = None
 
         # Explicit user-provided bucket list (or None). The concrete list of buckets actually used is
         # built from the data in `self.buckets` during preprocessing below.
@@ -1167,6 +1186,22 @@ class DreamBoothDataset(Dataset):
                 self.custom_instance_prompts = []
                 for caption in custom_instance_prompts:
                     self.custom_instance_prompts.extend(itertools.repeat(caption, repeats))
+
+            if getattr(args, "use_weighted_sampler", False) and split == "train":
+                col = args.weighted_sampler_column
+                if col not in column_names:
+                    raise ValueError(
+                        f"--weighted_sampler_column '{col}' not in dataset columns: {', '.join(column_names)}"
+                    )
+                w = args.weighted_sampler_weight
+                self.sample_weights = []
+                for flag in dataset["train"][col]:
+                    self.sample_weights.extend(itertools.repeat(w if flag else 1.0 - w, repeats))
+                n_true = sum(1 for f in dataset["train"][col] if f)
+                logger.info(
+                    f"Weighted sampler on '{col}': {n_true}/{len(dataset['train'])} truthy "
+                    f"({100 * n_true / max(len(dataset['train']), 1):.1f}%), weight {w} vs {1 - w}"
+                )
         else:
             self.instance_data_root = Path(instance_data_root)
             if not self.instance_data_root.exists():
@@ -1498,6 +1533,7 @@ class BucketBatchSampler(BatchSampler):
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.shuffle_batches_each_epoch = shuffle_batches_each_epoch
+        self.sample_weights = getattr(dataset, "sample_weights", None)
 
         # Group indices by bucket
         self.bucket_indices = [[] for _ in range(len(self.dataset.buckets))]
@@ -1507,13 +1543,25 @@ class BucketBatchSampler(BatchSampler):
         self.sampler_len = 0
         self.batches = []
 
-        # Pre-generate batches for each bucket
+        self._build_batches()
+
+    def _build_batches(self):
+        # Weighted draws happen inside a bucket so every batch keeps one geometry,
+        # which channel-concat and the pixel cache both require.
+        self.batches = []
+        self.sampler_len = 0
         for indices_in_bucket in self.bucket_indices:
-            # Shuffle indices within the bucket
-            random.shuffle(indices_in_bucket)
-            # Create batches
-            for i in range(0, len(indices_in_bucket), self.batch_size):
-                batch = indices_in_bucket[i : i + self.batch_size]
+            if self.sample_weights is not None and indices_in_bucket:
+                w = [self.sample_weights[i] for i in indices_in_bucket]
+                total = sum(w)
+                if total <= 0:
+                    raise ValueError("weighted sampler: all weights are zero in a bucket")
+                order = random.choices(indices_in_bucket, weights=w, k=len(indices_in_bucket))
+            else:
+                order = list(indices_in_bucket)
+                random.shuffle(order)
+            for i in range(0, len(order), self.batch_size):
+                batch = order[i : i + self.batch_size]
                 if len(batch) < self.batch_size and self.drop_last:
                     continue  # Skip partial batch if drop_last is True
                 self.batches.append(batch)
@@ -1526,6 +1574,8 @@ class BucketBatchSampler(BatchSampler):
 
     def __iter__(self):
         if self.shuffle_batches_each_epoch:
+            if self.sample_weights is not None:
+                self._build_batches()  # redraw, or one unlucky draw would persist all run
             random.shuffle(self.batches)
         for batch in self.batches:
             yield batch

@@ -37,6 +37,9 @@ ARGS=(
   --caption_column caption
   --instance_prompt "edit the exterior"
   --repeats 1
+  --use_weighted_sampler
+  --weighted_sampler_weight 0.8
+  --weighted_sampler_column self_edit
   --max_sequence_length 512 # token cap for the text prompt
   --channel_concat_cond # decides to concat based on channel on concat it in the tokens
   --conditioning_dropout_prob 0.05
