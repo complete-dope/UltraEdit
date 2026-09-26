@@ -11,7 +11,8 @@ MODEL="/workspace/models/FLUX.2-klein-base-4B" # base model
 DATASET_PATH="/workspace/datasets/exteriors-v5"
 OUTPUT_DIR="/workspace/runs/klein-base-4b-exteriors-v5-regionloss"
 RUN_NAME="klein-base-4b-exteriors-v5-regionloss"
-HUB_ID="fotello-ai/flux-klein-4b-exterior-v1"
+set -a; source "$(git rev-parse --show-toplevel)/.env"; set +a
+HUB_ID="${HF_ORG}/flux-klein-4b-exterior-v1"
 
 # HF_TOKEN lives in ~/.bashrc, which non-interactive shells skip; read it directly.
 # Never pass --hub_token: the trainer refuses it alongside --report_to wandb.
@@ -51,6 +52,8 @@ ARGS=(
   --resolution_height 1360
   --center_crop
   --random_crop_ratio 0.5
+  --random_flip # per-step flip of the target/cond pair
+  --enable_photo_variations # colour/exposure jitter on the source only
   --val_split_ratio 0.02
   --val_split_seed 42
   --eval_steps 500
@@ -66,8 +69,9 @@ ARGS=(
   --sample_batch_size 4
   --gradient_accumulation_steps 3 # 8 x 3 x 3 GPUs = 72
   --max_train_steps 20000 
-  --learning_rate 1e-5 # full finetune of transformer 4B params
-  --x_embedder_lr 1e-4 # cond half is zero-init; at 1e-5 it never becomes usable
+  --learning_rate 2.67e-6 # --scale_lr multiplies by batch x accum x num_gpus at runtime (3 GPUs -> 1.92e-4)
+  --scale_lr
+  --x_embedder_lr 1e-3 # not scaled; cond half is zero-init
   --lr_scheduler cosine
   --lr_warmup_steps 400
   --lr_num_cycles 1

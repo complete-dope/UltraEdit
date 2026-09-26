@@ -435,7 +435,7 @@ ol.reco li{{margin-bottom:8px;max-width:80ch}}
 </nav>
 <main>
 <h1>Klein Exterior Ablation</h1>
-<p class="sub">fotello-ai/flux-klein-4b-exterior-v1 · checkpoint-17000 · all 8 stages complete · 2026-09-20 · every table and picture is on this page, raw data linked per section</p>
+<p class="sub">{os.environ.get("HF_ORG", "")}/flux-klein-4b-exterior-v1 · checkpoint-17000 · all 8 stages complete · 2026-09-20 · every table and picture is on this page, raw data linked per section</p>
 {verdict}
 {"".join(parts)}
 {reco}

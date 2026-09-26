@@ -83,7 +83,8 @@ ARGS=(
 )
 
 export WANDB_NAME="$RUN_NAME"
-export WANDB_PROJECT="${WANDB_PROJECT:-fotello-exterior-edit}"
+set -a; source "$(git rev-parse --show-toplevel)/.env"; set +a
+export WANDB_PROJECT
 
 # FSDP full-shard: a fp32 4B full finetune needs 64GB of weights+grads+Adam per GPU under DDP,
 # which OOMs an 80GB A100 at 2K. Sharding over both GPUs brings it to ~32GB each.

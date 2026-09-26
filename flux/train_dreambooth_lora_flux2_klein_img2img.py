@@ -111,6 +111,7 @@ if is_wandb_available():
     import wandb
 
 from channel_concat_denoise import denoise_channel_concat
+from image_mutation import RandomPhotoAugmentation
 from wandb_logging import InferenceTable
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -599,6 +600,13 @@ def parse_args(input_args=None):
     )
     parser.add_argument("--changed_region_max", type=float, default=10.0, help="Clamp for the per-token region weight.")
     parser.add_argument(
+        "--enable_photo_variations",
+        action="store_true",
+        help="Per-step random brightness/contrast/tint/white-balance on the cond (source) image only, per sample, "
+        "so the model learns to correct colour/exposure toward the target. With --changed_region_loss the region "
+        "weights still come from the un-augmented source.",
+    )
+    parser.add_argument(
         "--transformer_dtype",
         type=str,
         default='fp32',
@@ -627,7 +635,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--random_flip",
         action="store_true",
-        help="whether to randomly flip images horizontally",
+        help="Per-step, per-sample horizontal flip of the target/cond pair (also applies to canvas crops).",
     )
     parser.add_argument(
         "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
@@ -977,6 +985,22 @@ def crop_window(x, crop):
     _, _, top, left = crop
     h, w = args.resolution_height, args.resolution_width
     return x[..., top : top + h, left : left + w].contiguous()
+
+
+def random_hflip_pair(pixel_values, cond_pixel_values, generator=None):
+    flip = torch.rand(pixel_values.shape[0], generator=generator, device=pixel_values.device) < 0.5
+    flip = flip.view(-1, 1, 1, 1)
+    return (
+        torch.where(flip, pixel_values.flip(-1), pixel_values),
+        torch.where(flip, cond_pixel_values.flip(-1), cond_pixel_values),
+    )
+
+
+def photo_augment_per_sample(augment, cond_pixel_values):
+    """Returns the augmented batch and the indices of samples that actually changed."""
+    augmented = torch.stack([augment(x.float()).to(x.dtype) for x in cond_pixel_values])
+    changed = [i for i in range(len(augmented)) if not torch.equal(augmented[i], cond_pixel_values[i])]
+    return augmented, changed
 
 
 def to_pixels(x, device=None, dtype=None):
@@ -2108,6 +2132,7 @@ def main(args):
         original_size=original_size,
         crop_size=train_crop_size,
         input_size=(args.input_height, args.input_width) if args.random_crop_ratio > 0 else None,
+        random_flip=False,  # flipped per step in the train loop
     )
     if train_dataset.input_size is not None and len(train_dataset.buckets) != 1:
         raise ValueError("--random_crop_ratio needs a single fixed resolution bucket.")
@@ -2419,7 +2444,13 @@ def main(args):
         return sigma
 
     def flow_matching_loss(
-        model_input, cond_model_input, prompt_embeds, text_ids, generator=None, conditioning_dropout_prob=None
+        model_input,
+        cond_model_input,
+        prompt_embeds,
+        text_ids,
+        generator=None,
+        conditioning_dropout_prob=None,
+        region_cond_input=None,
     ):
         model_input = Flux2KleinPipeline._patchify_latents(model_input)
         model_input = (model_input - latents_bn_mean) / latents_bn_std
@@ -2431,7 +2462,11 @@ def main(args):
         region_w = None
         if args.changed_region_loss:
             with torch.no_grad():
-                diff = (model_input.float() - cond_model_input.float()).norm(dim=1, keepdim=True)
+                region_ref = cond_model_input
+                if region_cond_input is not None:  # un-augmented source, so colour jitter doesn't flag everything
+                    region_ref = Flux2KleinPipeline._patchify_latents(region_cond_input)
+                    region_ref = (region_ref - latents_bn_mean) / latents_bn_std
+                diff = (model_input.float() - region_ref.float()).norm(dim=1, keepdim=True)
                 diff = diff / diff.mean(dim=(2, 3), keepdim=True).clamp_min(1e-6)
                 region_w = (1.0 + args.changed_region_weight * diff).clamp(max=args.changed_region_max)
                 region_w = region_w / region_w.mean(dim=(2, 3), keepdim=True)
@@ -2440,7 +2475,8 @@ def main(args):
             # InstructPix2Pix schedule on one draw: text dropped for p < 2q, image dropped for q <= p < 3q.
             # Image null = zeros in normalized latent space; the inference pipeline must use the same null.
             bsz = model_input.shape[0]
-            random_p = torch.rand(bsz, device=model_input.device)
+            rand_device = model_input.device if generator is None else generator.device
+            random_p = torch.rand(bsz, generator=generator, device=rand_device).to(model_input.device)
             prompt_mask = (random_p < 2 * conditioning_dropout_prob).reshape(bsz, 1, 1)
             null_embeds = null_prompt_embeds.to(prompt_embeds.device, dtype=prompt_embeds.dtype).expand_as(prompt_embeds)
             prompt_embeds = torch.where(prompt_mask, null_embeds, prompt_embeds)
@@ -2659,6 +2695,13 @@ def main(args):
         free_memory()
         transformer.train()
 
+    # Per-rank RNGs for augmentation/noise; global RNGs stay shared (batch sampler sharding, crop shapes).
+    # Offset by global_step since these generators aren't in accelerate's checkpointed RNG state.
+    base_seed = args.seed if args.seed is not None else random.SystemRandom().randrange(2**31)
+    aug_seed = base_seed + global_step * accelerator.num_processes + accelerator.process_index
+    flip_generator = torch.Generator(device=accelerator.device).manual_seed(aug_seed)
+    loss_generator = torch.Generator(device="cpu").manual_seed(aug_seed)
+    photo_augment = RandomPhotoAugmentation(seed=aug_seed) if args.enable_photo_variations else None
     epoch = first_epoch  # for the post-loop run_eval when no epoch runs
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()  # weights are unfreezed here now
@@ -2686,15 +2729,29 @@ def main(args):
                         pixel_values, cond_pixel_values = batch["pixel_values"], batch["cond_pixel_values"]
                     pixel_values = to_pixels(pixel_values, accelerator.device, vae.dtype)  # target / edited
                     cond_pixel_values = to_pixels(cond_pixel_values, accelerator.device, vae.dtype)  # source
+                    if args.random_flip:
+                        pixel_values, cond_pixel_values = random_hflip_pair(
+                            pixel_values, cond_pixel_values, generator=flip_generator
+                        )
                     model_input = vae.encode(pixel_values).latent_dist.mode()
                     cond_model_input = vae.encode(cond_pixel_values).latent_dist.mode()
+                    region_cond_input, num_photo_aug = None, 0
+                    if photo_augment is not None:
+                        augmented, changed = photo_augment_per_sample(photo_augment, cond_pixel_values)
+                        num_photo_aug = len(changed)
+                        if changed:
+                            region_cond_input = cond_model_input
+                            cond_model_input = cond_model_input.clone()
+                            cond_model_input[changed] = vae.encode(augmented[changed]).latent_dist.mode()
 
                 loss = flow_matching_loss(
                     model_input,
                     cond_model_input,
                     prompt_embeds,
                     text_ids,
+                    generator=loss_generator,
                     conditioning_dropout_prob=args.conditioning_dropout_prob,
+                    region_cond_input=region_cond_input,
                 )
 
                 accelerator.backward(loss)
@@ -2754,6 +2811,8 @@ def main(args):
                         logger.error(f"eval at step {global_step} failed, training continues: {e}", exc_info=True)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "random_crop": float(crop is not None)}
+            if photo_augment is not None:
+                logs["photo_aug"] = num_photo_aug / len(prompts)
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 

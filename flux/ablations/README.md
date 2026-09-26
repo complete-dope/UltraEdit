@@ -1,6 +1,6 @@
 # Ablations for the channel-concat Klein img2img model
 
-Scripts used for the 2026-09-20 ablation of `fotello-ai/flux-klein-4b-exterior-v1` checkpoint-17000.
+Scripts used for the 2026-09-20 ablation of `$HF_ORG/flux-klein-4b-exterior-v1` checkpoint-17000.
 Report and results: `/workspace/flux-ablation/results/REPORT.md`, artifact https://claude.ai/artifact/79ZmwuWoL36CAFxVk2XiK8
 
 Paths are read from env vars with the original run as defaults:

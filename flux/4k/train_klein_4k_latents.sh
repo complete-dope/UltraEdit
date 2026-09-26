@@ -8,6 +8,7 @@ cd "$(dirname "$0")"
 VENV="${VENV:-/opt/flux-venv}"
 [[ -x "$VENV/bin/python" ]] || VENV=/workspace/UltraEdit/.venv
 source "$VENV/bin/activate"
+set -a; source "$(git rev-parse --show-toplevel)/.env"; set +a
 echo "venv: $VENV"
 export HF_HOME=/workspace/hf_home
 export TOKENIZERS_PARALLELISM=false
@@ -95,7 +96,7 @@ ARGS=(
   --tracker_project_name flux2-klein-4k-latents
   --logging_dir logs
   --push_checkpoints_to_hub
-  --hub_model_id fotello-ai/flux-klein-4b-exterior-500-4k-model
+  --hub_model_id "${HF_ORG}"/flux-klein-4b-exterior-500-4k-model
   --hub_checkpoints_limit 0
 )
 
