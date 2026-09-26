@@ -1697,7 +1697,8 @@ def main(args):
 
     class SplitXEmbedder(torch.nn.Module):
         # Pretrained noise half and zero-init cond half as separate tensors so they can sit in
-        # different LR groups. State dict keeps the single fused `x_embedder.weight` key.
+        # different LR groups. On-disk `transformer/` folders keep the single fused `x_embedder.weight`
+        # (see fuse/split helpers below); accelerate's FSDP state files carry the split keys as-is.
         def __init__(self, old_proj):
             super().__init__()
             self.in_features = 2 * old_proj.in_features
@@ -1708,8 +1709,6 @@ def main(args):
             with torch.no_grad():
                 self.img_proj.weight.copy_(old_proj.weight)
                 self.cond_proj.weight.zero_()
-            self._register_state_dict_hook(self._fuse_state_dict)
-            self._register_load_state_dict_pre_hook(self._split_state_dict)
 
         def forward(self, x):
             half = self.in_features // 2
@@ -1719,20 +1718,22 @@ def main(args):
         def weight(self):
             return torch.cat([self.img_proj.weight, self.cond_proj.weight], dim=1)
 
-        @staticmethod
-        def _fuse_state_dict(module, state_dict, prefix, local_metadata):
-            img = state_dict.pop(f"{prefix}img_proj.weight", None)
-            cond = state_dict.pop(f"{prefix}cond_proj.weight", None)
-            if img is not None and cond is not None:
-                state_dict[f"{prefix}weight"] = torch.cat([img, cond], dim=1)
+    def fuse_x_embedder_state_dict(sd):
+        img, cond = sd.get("x_embedder.img_proj.weight"), sd.get("x_embedder.cond_proj.weight")
+        if img is None or cond is None:
+            return sd
+        sd = {k: v for k, v in sd.items() if not k.startswith("x_embedder.")}
+        sd["x_embedder.weight"] = torch.cat([img, cond], dim=1)
+        return sd
 
-        @staticmethod
-        def _split_state_dict(state_dict, prefix, *args):
-            w = state_dict.pop(f"{prefix}weight", None)
-            if w is not None:
-                half = w.shape[1] // 2
-                state_dict[f"{prefix}img_proj.weight"] = w[:, :half]
-                state_dict[f"{prefix}cond_proj.weight"] = w[:, half:]
+    def split_x_embedder_state_dict(sd):
+        w = sd.get("x_embedder.weight")
+        if w is None:
+            return sd
+        sd = {k: v for k, v in sd.items() if k != "x_embedder.weight"}
+        half = w.shape[1] // 2
+        sd["x_embedder.img_proj.weight"], sd["x_embedder.cond_proj.weight"] = w[:, :half], w[:, half:]
+        return sd
 
     def widen_x_embedder(model):
         old_proj = model.x_embedder
@@ -1836,10 +1837,12 @@ def main(args):
         return model
 
     def save_full_transformer(model, save_directory, state_dict=None):
-        # FSDP hands us an already-gathered state dict, so bypass save_pretrained and write it directly
+        # FSDP hands us an already-gathered state dict; either way write it directly so the split
+        # x_embedder is stored as the single fused key that from_pretrained expects
         if state_dict is None:
-            model.save_pretrained(save_directory)
-            return
+            state_dict = model.state_dict()
+        if args.channel_concat_cond:
+            state_dict = fuse_x_embedder_state_dict(state_dict)
         os.makedirs(save_directory, exist_ok=True)
         model.save_config(save_directory)
         save_file(_to_cpu_contiguous(state_dict), os.path.join(save_directory, "diffusion_pytorch_model.safetensors"))
@@ -1923,7 +1926,10 @@ def main(args):
 
         if is_full_finetune:
             loaded = Flux2Transformer2DModel.from_pretrained(input_dir, subfolder="transformer")
-            transformer_.load_state_dict(loaded.state_dict())
+            loaded_sd = loaded.state_dict()
+            if args.channel_concat_cond:
+                loaded_sd = split_x_embedder_state_dict(loaded_sd)
+            transformer_.load_state_dict(loaded_sd)
             del loaded
             free_memory()
             return
