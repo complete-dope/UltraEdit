@@ -2354,7 +2354,8 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        tracker_name = "dreambooth-flux2-image2img-lora"
+
+        tracker_name = os.environ.get("WANDB_PROJECT", "dreambooth-flux2-image2img-lora")
         accelerator.init_trackers(tracker_name, config=vars(args))
 
     # Train!
