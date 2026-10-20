@@ -1,0 +1,49 @@
+# Dependency set for the FLUX.2 [klein] image-to-image training in this directory.
+# The repo-root requirements.txt pins the upstream SD3/SDXL stack (torch 2.3.0+cu118,
+# transformers 4.41, vendored diffusers 0.30) and is NOT compatible with these scripts:
+# train_dreambooth_lora_flux2_klein_img2img.py requires diffusers >= 0.41.0.dev0 and
+# transformers with Qwen3ForCausalLM. Use a separate venv for each.
+#
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r flux/requirements.txt
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0+cu128
+torchvision==0.23.0+cu128
+
+# FLUX.2 klein support (Flux2KleinPipeline, Flux2Transformer2DModel, AutoencoderKLFlux2)
+# is not in a tagged release yet; check_min_version("0.41.0.dev0") requires git main.
+diffusers @ git+https://github.com/huggingface/diffusers.git@04e724ce518e087301052b65ff81ec35d54f4040
+
+transformers==5.17.0
+accelerate==1.15.0
+peft==0.20.0
+datasets==5.0.1
+huggingface_hub==1.30.0
+safetensors==0.8.0
+sentencepiece==0.2.2
+protobuf==7.36.1
+
+numpy==2.5.2
+pillow==12.3.0
+tqdm==4.70.0
+omegaconf==2.3.1
+
+# --report_to wandb, plus the InferenceTable panels in wandb_logging.py
+wandb==0.30.0
+# PSNR / LPIPS in run_eval and validate_checkpoints.py
+torchmetrics==1.9.0
+
+# optimizers: --use_8bit_adam and --optimizer prodigy
+bitsandbytes==0.50.2
+prodigyopt==1.1.2
+
+# faster hub downloads via HF_HUB_ENABLE_HF_TRANSFER=1
+hf_transfer==0.1.9
+
+# --do_fp8_training only (lazy import at train_...img2img.py:1282).
+# Pinned: torchao > 0.14.x requires torch >= 2.11 and fails to import on torch 2.8.
+torchao==0.14.1
+
+# uncomment for --report_to tensorboard
+# tensorboard
